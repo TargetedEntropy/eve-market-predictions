@@ -1,0 +1,53 @@
+# Core
+python-dotenv==1.0.1
+
+# Web Framework
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
+gunicorn==21.2.0
+pydantic==2.9.0
+pydantic-settings==2.5.0
+
+# Async HTTP
+httpx[http2]==0.27.0
+
+# Database
+sqlalchemy[asyncio]==2.0.25
+asyncpg==0.29.0
+
+# Caching & Rate Limiting
+redis[hiredis]==5.0.1
+aiometer==0.5.0
+
+# ML & Deep Learning
+torch==2.4.0
+numpy==1.26.3
+scipy==1.12.0
+scikit-learn==1.4.0
+
+# Data Processing
+pandas==2.2.0
+ta==0.11.0  # Technical Analysis library (alternative to pandas-ta)
+
+# MLOps
+mlflow==2.17.0
+evidently==0.4.34
+
+# Backtesting
+vectorbt==0.26.0
+
+# Task Scheduling
+apscheduler==3.10.4
+
+# Visualization
+plotly==5.24.0
+dash==2.18.0
+matplotlib==3.9.0
+seaborn==0.13.2
+
+# Development
+pytest==8.3.0
+pytest-asyncio==0.24.0
+pytest-cov==6.0.0
+black==24.10.0
+ruff==0.7.0
