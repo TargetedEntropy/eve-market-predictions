@@ -90,6 +90,26 @@ services:
       - mlflow_data:/mlflow
     restart: unless-stopped
 
+  # Dashboard
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: eve-dashboard
+    command: python src/dashboard/app.py
+    ports:
+      - "8050:8050"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://eve_user:${DB_PASSWORD:-changeme}@postgres:5432/eve_markets
+      REDIS_URL: redis://redis:6379/0
+      LOG_LEVEL: INFO
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   postgres_data:
   redis_data:
