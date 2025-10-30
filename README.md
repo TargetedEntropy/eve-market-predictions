@@ -4,40 +4,54 @@ A production-ready machine learning system for predicting EVE Online market pric
 
 ## Features
 
-- 🚀 **LSTM Neural Network** for price prediction
+- 🚀 **LSTM Neural Network** for price prediction with PyTorch
 - 📊 **Real-time data collection** from ESI API (every 5 minutes)
+- 📈 **Interactive Dashboard** with Dash/Plotly for data visualization
 - 🔧 **Automated feature engineering** with 50+ technical indicators
 - 🎯 **FastAPI REST API** for serving predictions
-- 📈 **MLflow integration** for experiment tracking
-- 🐳 **Docker deployment** with full stack (PostgreSQL + TimescaleDB, Redis, MLflow)
+- 📉 **Historical data import** from EVE Ref (2003-present)
+- 🤖 **Bulk prediction** for all tracked items (30-day forecasts)
+- 🐳 **Docker deployment** with full stack (6 services)
 - ⏰ **APScheduler** for automated data collection and model retraining
 - 💾 **Time-series optimized** database with TimescaleDB
+- 🔬 **MLflow integration** for experiment tracking and model versioning
 
 ## Architecture
 
 ```
-┌─────────────────┐     ┌──────────────┐     ┌─────────────┐
-│  ESI API        │────▶│ Data         │────▶│ PostgreSQL  │
-│  (EVE Online)   │     │ Collector    │     │ +TimescaleDB│
-└─────────────────┘     └──────────────┘     └─────────────┘
+┌─────────────────┐     ┌──────────────┐     ┌─────────────────┐
+│  ESI API        │────▶│ Data         │────▶│ PostgreSQL      │
+│  (EVE Online)   │     │ Collector    │     │ + TimescaleDB   │
+└─────────────────┘     └──────────────┘     └─────────────────┘
+                              │                      │
+┌─────────────────┐           │                      │
+│  EVE Ref        │───────────┘                      │
+│  (Historical)   │                                  │
+└─────────────────┘                                  │
+                                                     ▼
+                        ┌──────────────┐     ┌─────────────────┐
+                        │ Feature      │────▶│ Feature Store   │
+                        │ Engineering  │     │ + Redis Cache   │
+                        └──────────────┘     └─────────────────┘
                               │                      │
                               ▼                      ▼
-                        ┌──────────────┐     ┌─────────────┐
-                        │ Feature      │────▶│ Feature     │
-                        │ Engineering  │     │ Store       │
-                        └──────────────┘     └─────────────┘
+                        ┌──────────────┐     ┌─────────────────┐
+                        │ LSTM Model   │◀────│ Training        │
+                        │ (PyTorch)    │     │ Pipeline        │
+                        └──────────────┘     └─────────────────┘
                               │                      │
                               ▼                      ▼
-                        ┌──────────────┐     ┌─────────────┐
-                        │ LSTM Model   │◀────│ Training    │
-                        │ (PyTorch)    │     │ Pipeline    │
-                        └──────────────┘     └─────────────┘
-                              │                      │
-                              ▼                      ▼
-                        ┌──────────────┐     ┌─────────────┐
-                        │ FastAPI      │     │ MLflow      │
-                        │ Prediction   │     │ Tracking    │
-                        └──────────────┘     └─────────────┘
+                  ┌──────────────────┐       ┌─────────────────┐
+                  │ FastAPI Server   │       │ MLflow Tracking │
+                  │ (Predictions)    │       │ (Experiments)   │
+                  └──────────────────┘       └─────────────────┘
+                              │
+                ┌─────────────┴─────────────┐
+                ▼                           ▼
+        ┌──────────────┐            ┌──────────────┐
+        │  Dashboard   │            │   REST API   │
+        │ (Dash/Plotly)│            │   Clients    │
+        └──────────────┘            └──────────────┘
 ```
 
 ## Quick Start (Docker)
@@ -78,9 +92,10 @@ docker compose exec collector python scripts/collect_data.py
 
 ### 4. Access Services
 
+- **Dashboard**: http://localhost:8050 (Interactive market visualization)
 - **API**: http://localhost:8000
-- **API Docs**: http://localhost:8000/docs
-- **MLflow UI**: http://localhost:5000
+- **API Docs**: http://localhost:8000/docs (Swagger UI)
+- **MLflow UI**: http://localhost:5000 (Experiment tracking)
 - **Health Check**: http://localhost:8000/health
 
 ## Local Development Setup
@@ -193,6 +208,65 @@ trainer = ModelTrainer(
 metrics = trainer.train(dataset, val_split=0.2)
 ```
 
+## Dashboard Usage
+
+The interactive dashboard provides real-time market visualization and analysis.
+
+### Accessing the Dashboard
+
+Open http://localhost:8050 in your web browser.
+
+### Features
+
+- **Price History Charts**: High/low/average price trends with interactive zoom
+- **Volume Analysis**: Trading volume bar charts
+- **Price Distribution**: Histogram showing price ranges
+- **Multi-Item Support**: 11 tracked items (PLEX, Skill Injectors, Minerals, etc.)
+- **Multiple Regions**: The Forge (Jita), Domain (Amarr), Sinq Laison (Dodixie)
+- **Time Range Selection**: 30 days, 90 days, 6 months, 1 year, all time
+- **Auto-Refresh**: Updates every 60 seconds
+- **Dark Theme**: Professional Cyborg theme optimized for trading
+
+### Tracked Items
+
+- PLEX
+- Large Skill Injector
+- Skill Extractor
+- Tritanium, Pyerite, Mexallon
+- Isogen, Nocxium, Zydrine
+- Megacyte, Morphite
+
+## Bulk Predictions
+
+Generate 30-day price forecasts for all tracked items:
+
+```bash
+# Run predictions for all 11 items
+docker compose exec collector python scripts/predict_all_items.py
+
+# Check results
+docker compose exec collector cat data/predictions_summary.json
+```
+
+Each prediction includes:
+- Current price
+- Predicted price (30 days ahead)
+- Percentage change
+- Day-by-day forecast
+- Model validation loss
+
+### Import Historical Data
+
+Import years of historical market data from EVE Ref:
+
+```bash
+# Import last 90 days for all items
+docker compose exec collector python scripts/import_everef_data.py
+
+# Data available from 2003 to present
+# Automatically filtered for tracked items
+```
+
 ## API Usage
 
 ### Health Check
@@ -240,6 +314,7 @@ eve-discovery/
 ├── src/
 │   ├── api/              # FastAPI application
 │   ├── collectors/       # ESI API clients & data collectors
+│   ├── dashboard/        # Dash/Plotly interactive dashboard
 │   ├── database/         # SQLAlchemy models & connections
 │   ├── features/         # Feature engineering pipeline
 │   ├── models/           # PyTorch LSTM model & training
@@ -249,16 +324,21 @@ eve-discovery/
 ├── scripts/
 │   ├── init_database.py       # Database initialization
 │   ├── collect_data.py        # Manual data collection
+│   ├── train_model.py         # Train LSTM model
+│   ├── predict_item.py        # Single item prediction
+│   ├── predict_all_items.py   # Bulk prediction (all items)
+│   ├── import_everef_data.py  # Import historical data
 │   └── scheduler_daemon.py    # Automated collection daemon
 │
 ├── data/
 │   ├── raw/              # Raw collected data
 │   ├── processed/        # Processed features
-│   └── models/           # Trained model files
+│   ├── models/           # Trained model files
+│   └── predictions_*.json     # Prediction outputs
 │
 ├── requirements.txt      # Python dependencies
 ├── Dockerfile           # Application container
-├── docker-compose.yml   # Full stack deployment
+├── docker-compose.yml   # Full stack deployment (6 services)
 ├── .env.example         # Environment template
 └── README.md           # This file
 ```
@@ -297,6 +377,21 @@ docker compose up --build -d
 docker compose exec api python scripts/collect_data.py
 docker compose exec postgres psql -U eve_user eve_markets
 ```
+
+## Docker Services
+
+The application runs 6 containerized services:
+
+| Service | Port | Description |
+|---------|------|-------------|
+| **postgres** | 5432 | PostgreSQL 15 + TimescaleDB for time-series data |
+| **redis** | 6379 | Redis cache for rate limiting and caching |
+| **collector** | - | Background daemon for data collection (ESI API) |
+| **api** | 8000 | FastAPI server for predictions and health checks |
+| **mlflow** | 5000 | MLflow tracking server for experiments |
+| **dashboard** | 8050 | Dash/Plotly interactive visualization dashboard |
+
+All services use automatic health checks and restart policies for reliability.
 
 ## Monitoring
 
@@ -405,13 +500,27 @@ ON predictions (type_id, prediction_time DESC);
 
 ## Roadmap
 
-- [ ] Web dashboard with Dash/Plotly
-- [ ] Backtesting framework integration
+### Completed ✅
+- [x] Web dashboard with Dash/Plotly
+- [x] Historical data import from EVE Ref
+- [x] Bulk prediction for all tracked items
+- [x] Interactive price charts and visualizations
+- [x] Docker containerization (6 services)
+- [x] LSTM model training pipeline
+- [x] Real-time data collection from ESI
+
+### In Progress 🚧
 - [ ] Model drift detection with Evidently
-- [ ] Multi-region support
+- [ ] Backtesting framework integration
+- [ ] Prediction confidence intervals
+
+### Planned 📋
+- [ ] Multi-region price correlation analysis
 - [ ] Automated hyperparameter tuning
 - [ ] Real-time WebSocket predictions
 - [ ] Mobile app API endpoints
+- [ ] Trading signal generation
+- [ ] Portfolio optimization recommendations
 
 ## Contributing
 
@@ -428,9 +537,12 @@ MIT License - see LICENSE file for details
 ## Acknowledgments
 
 - **EVE Online** and **CCP Games** for the ESI API
-- **TimescaleDB** for time-series database
+- **EVE Ref** (data.everef.net) for historical market data archive
+- **TimescaleDB** for time-series database excellence
 - **PyTorch** for deep learning framework
 - **FastAPI** for modern Python web framework
+- **Plotly/Dash** for interactive data visualization
+- **MLflow** for experiment tracking and model versioning
 
 ## Support
 
