@@ -11,6 +11,7 @@ A production-ready machine learning system for predicting EVE Online market pric
 - 🎯 **FastAPI REST API** for serving predictions
 - 📉 **Historical data import** from EVE Ref (2003-present)
 - 🤖 **Bulk prediction** for all tracked items (30-day forecasts)
+- 🔍 **Model drift detection** with Evidently AI for monitoring
 - 🐳 **Docker deployment** with full stack (6 services)
 - ⏰ **APScheduler** for automated data collection and model retraining
 - 💾 **Time-series optimized** database with TimescaleDB
@@ -267,6 +268,48 @@ docker compose exec collector python scripts/import_everef_data.py
 # Automatically filtered for tracked items
 ```
 
+## Model Drift Detection
+
+Monitor model performance and detect data/prediction drift using Evidently AI:
+
+```bash
+# Check all items for drift
+docker compose exec collector python scripts/check_drift.py
+
+# View summary
+docker compose exec collector cat data/drift_summary.json
+```
+
+### What is Drift Detection?
+
+Model drift occurs when:
+- **Data Drift**: Input feature distributions change over time (market conditions, game updates)
+- **Target Drift**: Price prediction patterns shift (meta changes, economic events)
+
+### Drift Detection Features
+
+- **Reference Window**: 30-day baseline period for comparison
+- **Current Window**: 7-day recent data to detect changes
+- **Drift Threshold**: Configurable sensitivity (default: 50% of features)
+- **HTML Reports**: Detailed visualizations for each item in `data/drift_reports/`
+- **JSON Summary**: Machine-readable drift status in `data/drift_summary.json`
+
+### Interpreting Results
+
+When drift is detected:
+1. Review HTML reports to identify which features drifted
+2. Investigate EVE Online events (patches, expansions, meta shifts)
+3. Consider retraining models with recent data
+4. Update feature engineering if market dynamics changed
+
+Example output:
+```
+Items with target drift: 5/11
+- Large Skill Injector: Target drift detected ⚠️
+- Tritanium: Target drift detected ⚠️
+- Isogen: Target drift detected ⚠️
+```
+
 ## API Usage
 
 ### Health Check
@@ -318,6 +361,7 @@ eve-discovery/
 │   ├── database/         # SQLAlchemy models & connections
 │   ├── features/         # Feature engineering pipeline
 │   ├── models/           # PyTorch LSTM model & training
+│   ├── monitoring/       # Drift detection with Evidently AI
 │   ├── utils/            # Utility functions
 │   └── config.py         # Configuration management
 │
@@ -328,13 +372,16 @@ eve-discovery/
 │   ├── predict_item.py        # Single item prediction
 │   ├── predict_all_items.py   # Bulk prediction (all items)
 │   ├── import_everef_data.py  # Import historical data
+│   ├── check_drift.py         # Model drift detection
 │   └── scheduler_daemon.py    # Automated collection daemon
 │
 ├── data/
 │   ├── raw/              # Raw collected data
 │   ├── processed/        # Processed features
 │   ├── models/           # Trained model files
-│   └── predictions_*.json     # Prediction outputs
+│   ├── drift_reports/    # HTML drift detection reports
+│   ├── predictions_*.json     # Prediction outputs
+│   └── drift_summary.json     # Drift detection summary
 │
 ├── requirements.txt      # Python dependencies
 ├── Dockerfile           # Application container
@@ -508,11 +555,12 @@ ON predictions (type_id, prediction_time DESC);
 - [x] Docker containerization (6 services)
 - [x] LSTM model training pipeline
 - [x] Real-time data collection from ESI
+- [x] Model drift detection with Evidently
 
 ### In Progress 🚧
-- [ ] Model drift detection with Evidently
 - [ ] Backtesting framework integration
 - [ ] Prediction confidence intervals
+- [ ] Automated drift detection scheduling
 
 ### Planned 📋
 - [ ] Multi-region price correlation analysis
@@ -543,11 +591,12 @@ MIT License - see LICENSE file for details
 - **FastAPI** for modern Python web framework
 - **Plotly/Dash** for interactive data visualization
 - **MLflow** for experiment tracking and model versioning
+- **Evidently AI** for model drift detection and monitoring
 
 ## Support
 
 For issues and questions:
-- GitHub Issues: [your-repo/issues]
+- GitHub Issues: [https://github.com/TargetedEntropy/eve-market-predictions/issues]
 - EVE Online API Documentation: https://developers.eveonline.com/
 - TimescaleDB Docs: https://docs.timescale.com/
 
