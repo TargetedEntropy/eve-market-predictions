@@ -1,211 +1,124 @@
 #!/usr/bin/env python3
-"""Train model and generate predictions for a specific item"""
+"""Generate price predictions for one item from its saved model.
 
+This predicts from the checkpoint on disk; it does **not** retrain unless you
+pass ``--train``. (The previous version retrained on every run and overwrote a
+single shared ``best_model.pth``, so "predicting" one item silently replaced
+the model the API was serving for every other item.)
+
+The forecast is autoregressive: the model predicts one day ahead, that value is
+fed back in, and so on. Error compounds with horizon -- day 30 is a trend
+indication, not a quote.
+
+Every run writes rows to the ``predictions`` table so accuracy can be scored
+later by ``scripts/evaluate_predictions.py``.
+
+Examples::
+
+    python scripts/predict_item.py 40520              # Large Skill Injector, 30 days
+    python scripts/predict_item.py 44992 --days 7
+    python scripts/predict_item.py 44992 --train      # retrain first
+"""
+
+import argparse
 import asyncio
-import sys
+import json
 import logging
+import sys
 from pathlib import Path
-from datetime import datetime, timedelta
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-import pandas as pd
-import numpy as np
-import torch
-from sklearn.preprocessing import MinMaxScaler
-from sqlalchemy import select
-
 from src.config import settings
-from src.database import get_session, MarketHistory, Item
-from src.models import MarketLSTM, MarketDataset, ModelTrainer
+from src.models.pipeline import (
+    InsufficientData,
+    ModelNotTrained,
+    generate_predictions,
+    train_item,
+)
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 
-async def get_item_name(type_id: int) -> str:
-    """Get item name from database"""
-    async with get_session() as session:
-        result = await session.execute(
-            select(Item).where(Item.type_id == type_id)
-        )
-        item = result.scalar_one_or_none()
-        return item.name if item else f"Unknown Item ({type_id})"
-
-
-async def train_and_predict(
-    type_id: int,
-    region_id: int = 10000002,
-    prediction_days: int = 30,
-    epochs: int = 50
-):
-    """Train model and generate predictions for an item"""
-
-    item_name = await get_item_name(type_id)
-    logger.info(f"Training model for: {item_name} (type_id={type_id})")
-
-    # Fetch historical data
-    async with get_session() as session:
-        result = await session.execute(
-            select(MarketHistory)
-            .where(MarketHistory.type_id == type_id)
-            .where(MarketHistory.region_id == region_id)
-            .order_by(MarketHistory.time)
-        )
-        records = result.scalars().all()
-
-    if not records:
-        logger.error(f"No historical data found for type_id={type_id}")
-        return None
-
-    logger.info(f"Retrieved {len(records)} historical records")
-
-    # Convert to DataFrame
-    df = pd.DataFrame([{
-        'time': r.time,
-        'average': float(r.average) if r.average else 0.0,
-        'volume': r.volume if r.volume else 0,
-    } for r in records])
-
-    # Remove any rows with zero price
-    df = df[df['average'] > 0]
-    logger.info(f"After filtering: {len(df)} records with valid prices")
-
-    if len(df) < settings.lookback_window + 10:
-        logger.error(f"Not enough data! Need at least {settings.lookback_window + 10} records")
-        return None
-
-    # Show price statistics
-    logger.info(f"Price range: {df['average'].min():,.2f} - {df['average'].max():,.2f} ISK")
-    logger.info(f"Average price: {df['average'].mean():,.2f} ISK")
-
-    # Prepare sequences for LSTM
-    scaler = MinMaxScaler()
-    scaled_prices = scaler.fit_transform(df[['average']])
-
-    lookback = settings.lookback_window
-    sequences = []
-    targets = []
-
-    for i in range(lookback, len(scaled_prices)):
-        sequences.append(scaled_prices[i-lookback:i])
-        targets.append(scaled_prices[i][0])
-
-    sequences = np.array(sequences)
-    targets = np.array(targets)
-
-    logger.info(f"Created {len(sequences)} training sequences")
-
-    # Create dataset
-    dataset = MarketDataset(sequences, targets)
-
-    # Train model
-    logger.info("Training LSTM model...")
-    trainer = ModelTrainer(
-        input_size=1,
-        hidden_size=128,
-        num_layers=2,
-        dropout=0.2,
-        learning_rate=0.001,
-        epochs=epochs,
-        batch_size=32,
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-
-    metrics = trainer.train(dataset, val_split=0.2, experiment_name=None)
-
-    logger.info(f"Training complete!")
-    logger.info(f"Best validation loss: {metrics['best_val_loss']:.6f}")
-
-    # Generate predictions
-    logger.info(f"Generating {prediction_days}-day predictions...")
-
-    # Use the last lookback_window prices as input
-    last_sequence = scaled_prices[-lookback:].reshape(1, lookback, 1)
-
-    predictions = []
-    current_sequence = torch.FloatTensor(last_sequence)
-
-    trainer.model.eval()
-    with torch.no_grad():
-        for day in range(prediction_days):
-            # Predict next value
-            pred = trainer.model(current_sequence)
-            pred_value = pred.cpu().numpy()[0][0]
-            predictions.append(pred_value)
-
-            # Update sequence for next prediction
-            current_sequence = torch.cat([
-                current_sequence[:, 1:, :],
-                torch.FloatTensor([[[pred_value]]])
-            ], dim=1)
-
-    # Inverse transform predictions
-    predictions_scaled = np.array(predictions).reshape(-1, 1)
-    predictions_actual = scaler.inverse_transform(predictions_scaled)
-
-    # Create prediction DataFrame
-    last_date = df['time'].max()
-    prediction_dates = [last_date + timedelta(days=i+1) for i in range(prediction_days)]
-
-    predictions_df = pd.DataFrame({
-        'date': prediction_dates,
-        'predicted_price': predictions_actual.flatten(),
-    })
-
-    # Add historical context
-    historical_recent = df.tail(30)[['time', 'average']].copy()
-    historical_recent.columns = ['date', 'actual_price']
-
-    logger.info("\n" + "="*80)
-    logger.info(f"PRICE PREDICTIONS FOR {item_name.upper()}")
-    logger.info("="*80)
-    logger.info(f"\nCurrent Price (latest): {df['average'].iloc[-1]:,.2f} ISK")
-    logger.info(f"Predicted Price (30 days): {predictions_actual[-1][0]:,.2f} ISK")
-    logger.info(f"Change: {((predictions_actual[-1][0] / df['average'].iloc[-1]) - 1) * 100:+.2f}%")
-    logger.info("\n" + "="*80)
-    logger.info("\nDay-by-Day Predictions (First 10 days):")
-    logger.info("-" * 80)
-
-    for idx, row in predictions_df.head(10).iterrows():
-        logger.info(f"Day {idx+1:2d} ({row['date'].strftime('%Y-%m-%d')}): {row['predicted_price']:>15,.2f} ISK")
-
-    logger.info("\n" + "="*80)
-
-    return {
-        'item_name': item_name,
-        'type_id': type_id,
-        'region_id': region_id,
-        'current_price': float(df['average'].iloc[-1]),
-        'predicted_price_30d': float(predictions_actual[-1][0]),
-        'percent_change': float(((predictions_actual[-1][0] / df['average'].iloc[-1]) - 1) * 100),
-        'predictions': predictions_df.to_dict('records'),
-        'historical': historical_recent.to_dict('records'),
-        'metrics': metrics,
-    }
+    parser.add_argument("type_id", type=int, help="Item type_id to forecast")
+    parser.add_argument("--days", type=int, default=settings.prediction_horizon_days,
+                        help="Forecast horizon in days")
+    parser.add_argument("--region-id", type=int, default=None,
+                        help=f"Region id (default: {settings.region_ids[0]})")
+    parser.add_argument("--train", action="store_true",
+                        help="Retrain this item's model before forecasting")
+    parser.add_argument("--epochs", type=int, default=50, help="Epochs when --train is used")
+    parser.add_argument("--json", dest="json_path", default=None,
+                        help="Also write the result to this JSON file")
+    parser.add_argument("--no-store", action="store_true",
+                        help="Skip writing rows to the predictions table")
+    return parser.parse_args(argv)
 
 
-async def main():
-    """Main prediction function"""
-    import os
+def print_report(result):
+    print("\n" + "=" * 80)
+    print(f"{result['item_name'].upper()} - {result['horizon_days']}-DAY PRICE FORECAST")
+    print("=" * 80)
+    print(f"Model version:       {result['model_version']}")
+    confidence = result["confidence"]
+    print(f"Confidence:          "
+          f"{'n/a' if confidence is None else f'{confidence:.2%} (1 - validation MAPE)'}")
+    print(f"Last observed day:   {result['last_observed_date']:%Y-%m-%d}")
+    print(f"Current price:       {result['current_price']:>20,.0f} ISK")
+    print(f"Predicted price:     {result['predicted_price']:>20,.0f} ISK")
+    print(f"Expected change:     {result['percent_change']:>19.2f}%")
+    print("-" * 80)
+    for row in result["predictions"][:10]:
+        print(f"Day {row['day']:2d} ({row['date']}): {row['predicted_price']:>20,.0f} ISK")
+    if len(result["predictions"]) > 10:
+        print("...")
+        for row in result["predictions"][-3:]:
+            print(f"Day {row['day']:2d} ({row['date']}): {row['predicted_price']:>20,.0f} ISK")
+    print("=" * 80)
 
-    # Get type_id from command line or use default
-    type_id = int(sys.argv[1]) if len(sys.argv) > 1 else 40520
-    prediction_days = int(sys.argv[2]) if len(sys.argv) > 2 else 30
 
-    # Set MLflow URI if not set
-    if 'MLFLOW_TRACKING_URI' not in os.environ:
-        os.environ['MLFLOW_TRACKING_URI'] = 'http://mlflow:5000'
+async def main(argv=None):
+    args = parse_args(argv)
+    region_id = args.region_id or settings.region_ids[0]
 
-    result = await train_and_predict(
-        type_id=type_id,
-        region_id=10000002,  # The Forge (Jita)
-        prediction_days=prediction_days,
-        epochs=50
-    )
+    if args.train:
+        try:
+            training = await train_item(
+                type_id=args.type_id, region_id=region_id, epochs=args.epochs
+            )
+        except InsufficientData as e:
+            logger.error(str(e))
+            return 1
+        logger.info(
+            f"Trained {training.item_name}: val MAPE {training.metrics['val_mape']:.2f}%"
+        )
 
-    if result:
-        logger.info("\nPrediction complete! Results saved above.")
+    try:
+        result = await generate_predictions(
+            type_id=args.type_id,
+            region_id=region_id,
+            horizon_days=args.days,
+            store=not args.no_store,
+        )
+    except (ModelNotTrained, InsufficientData) as e:
+        logger.error(str(e))
+        return 1
+
+    print_report(result)
+
+    if args.json_path:
+        output = Path(args.json_path)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps(result, indent=2, default=str))
+        print(f"\nSaved to {output}")
+
+    return 0
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    sys.exit(asyncio.run(main()))

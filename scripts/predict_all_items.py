@@ -1,245 +1,145 @@
 #!/usr/bin/env python3
-"""Train models and save predictions for all tracked items"""
+"""Generate predictions for every tracked item.
 
+Predicts from the saved per-item checkpoints (``--train`` retrains first).
+Results go to the ``predictions`` table; the JSON files are an optional export
+for offline inspection.
+
+Examples::
+
+    python scripts/predict_all_items.py                 # forecast from saved models
+    python scripts/predict_all_items.py --train         # retrain everything first
+    python scripts/predict_all_items.py --json-dir data # also write JSON
+"""
+
+import argparse
 import asyncio
-import sys
 import json
+import logging
+import sys
 from pathlib import Path
-from datetime import datetime, timedelta
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-import pandas as pd
-import numpy as np
-import torch
-from sklearn.preprocessing import MinMaxScaler
-from sqlalchemy import select
-
 from src.config import settings
-from src.database import get_session, MarketHistory, Item
-from src.models import MarketLSTM, MarketDataset, ModelTrainer
+from src.constants import TRACKED_TYPE_IDS, item_name
+from src.models.pipeline import (
+    InsufficientData,
+    ModelNotTrained,
+    generate_predictions,
+    train_item,
+)
+from src.utils.timeutils import utcnow
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
 
 
-# Items to predict
-ITEMS = [
-    {'name': 'PLEX', 'type_id': 44992},
-    {'name': 'Large Skill Injector', 'type_id': 40520},
-    {'name': 'Skill Extractor', 'type_id': 40519},
-    {'name': 'Tritanium', 'type_id': 34},
-    {'name': 'Pyerite', 'type_id': 35},
-    {'name': 'Mexallon', 'type_id': 36},
-    {'name': 'Isogen', 'type_id': 37},
-    {'name': 'Nocxium', 'type_id': 38},
-    {'name': 'Zydrine', 'type_id': 39},
-    {'name': 'Megacyte', 'type_id': 40},
-    {'name': 'Morphite', 'type_id': 11399},
-]
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument("--region-id", type=int, default=None,
+                        help=f"Region id (default: {settings.region_ids[0]})")
+    parser.add_argument("--days", type=int, default=settings.prediction_horizon_days)
+    parser.add_argument("--train", action="store_true",
+                        help="Retrain each item's model before forecasting")
+    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--json-dir", default=None,
+                        help="Directory for optional per-item JSON exports")
+    parser.add_argument("--no-store", action="store_true",
+                        help="Skip writing rows to the predictions table")
+    return parser.parse_args(argv)
 
 
-async def predict_item(type_id: int, item_name: str):
-    """Train and predict for a specific item"""
+async def main(argv=None):
+    args = parse_args(argv)
+    region_id = args.region_id or settings.region_ids[0]
 
-    region_id = 10000002  # The Forge
-
-    print(f"\n{'='*80}")
-    print(f"Processing: {item_name} (type_id={type_id})")
-    print(f"{'='*80}")
-
-    try:
-        # Fetch historical data
-        async with get_session() as session:
-            result = await session.execute(
-                select(MarketHistory)
-                .where(MarketHistory.type_id == type_id)
-                .where(MarketHistory.region_id == region_id)
-                .order_by(MarketHistory.time)
-            )
-            records = result.scalars().all()
-
-        if len(records) < 50:
-            print(f"⚠ Insufficient data: {len(records)} records (need at least 50)")
-            return None
-
-        print(f"✓ Found {len(records)} historical records")
-
-        # Convert to DataFrame
-        df = pd.DataFrame([{
-            'time': r.time,
-            'average': float(r.average) if r.average else 0.0,
-        } for r in records])
-
-        df = df[df['average'] > 0]
-
-        if len(df) < 50:
-            print(f"⚠ Insufficient valid data: {len(df)} records after filtering")
-            return None
-
-        print(f"  Price range: {df['average'].min():,.0f} - {df['average'].max():,.0f} ISK")
-        print(f"  Average price: {df['average'].mean():,.0f} ISK")
-
-        # Prepare data
-        scaler = MinMaxScaler()
-        scaled_prices = scaler.fit_transform(df[['average']])
-
-        lookback = 30
-        sequences = []
-        targets = []
-
-        for i in range(lookback, len(scaled_prices)):
-            sequences.append(scaled_prices[i-lookback:i])
-            targets.append(scaled_prices[i][0])
-
-        if len(sequences) < 20:
-            print(f"⚠ Insufficient sequences: {len(sequences)} (need at least 20)")
-            return None
-
-        sequences = np.array(sequences)
-        targets = np.array(targets)
-
-        dataset = MarketDataset(sequences, targets)
-
-        # Train
-        print(f"  Training LSTM model on {len(sequences)} sequences...")
-        trainer = ModelTrainer(
-            input_size=1,
-            hidden_size=128,
-            num_layers=2,
-            dropout=0.2,
-            learning_rate=0.001,
-            epochs=50,
-            batch_size=32,
-        )
-
-        metrics = trainer.train(dataset, val_split=0.2, experiment_name=None)
-        print(f"  ✓ Training complete! Val loss: {metrics['best_val_loss']:.6f}")
-
-        # Generate predictions
-        print(f"  Generating 30-day predictions...")
-
-        last_sequence = scaled_prices[-lookback:].reshape(1, lookback, 1)
-        predictions = []
-        current_sequence = torch.FloatTensor(last_sequence)
-
-        trainer.model.eval()
-        with torch.no_grad():
-            for day in range(30):
-                pred = trainer.model(current_sequence)
-                pred_value = pred.cpu().numpy()[0][0]
-                predictions.append(pred_value)
-
-                current_sequence = torch.cat([
-                    current_sequence[:, 1:, :],
-                    torch.FloatTensor([[[pred_value]]])
-                ], dim=1)
-
-        # Inverse transform
-        predictions_scaled = np.array(predictions).reshape(-1, 1)
-        predictions_actual = scaler.inverse_transform(predictions_scaled)
-
-        # Create results
-        last_date = df['time'].max()
-        prediction_dates = [last_date + timedelta(days=i+1) for i in range(30)]
-
-        current_price = float(df['average'].iloc[-1])
-        predicted_price_30d = float(predictions_actual[-1][0])
-        percent_change = float(((predicted_price_30d / current_price) - 1) * 100)
-
-        results = {
-            'item_name': item_name,
-            'type_id': type_id,
-            'region_id': region_id,
-            'training_date': datetime.now().isoformat(),
-            'current_price': current_price,
-            'predicted_price_30d': predicted_price_30d,
-            'percent_change': percent_change,
-            'best_val_loss': float(metrics['best_val_loss']),
-            'data_points': len(records),
-            'predictions': []
-        }
-
-        for i in range(30):
-            results['predictions'].append({
-                'day': i + 1,
-                'date': prediction_dates[i].strftime('%Y-%m-%d'),
-                'predicted_price': float(predictions_actual[i][0])
-            })
-
-        # Save to file
-        safe_name = item_name.lower().replace(' ', '_')
-        output_file = Path(f'data/predictions_{safe_name}.json')
-        output_file.parent.mkdir(parents=True, exist_ok=True)
-        with open(output_file, 'w') as f:
-            json.dump(results, f, indent=2)
-
-        print(f"  ✓ Current: {current_price:,.0f} ISK")
-        print(f"  ✓ Predicted (30d): {predicted_price_30d:,.0f} ISK")
-        print(f"  ✓ Change: {percent_change:+.2f}%")
-        print(f"  ✓ Saved to: {output_file}")
-
-        return results
-
-    except Exception as e:
-        print(f"  ✗ Error: {e}")
-        import traceback
-        traceback.print_exc()
-        return None
-
-
-async def main():
-    """Process all items"""
-
-    print("\n" + "="*80)
+    print("\n" + "=" * 80)
     print("EVE ONLINE - BULK PRICE PREDICTION")
-    print(f"Processing {len(ITEMS)} items...")
-    print("="*80)
+    print(f"Processing {len(TRACKED_TYPE_IDS)} items in region {region_id}")
+    print("=" * 80)
 
-    results = []
-    successful = 0
-    failed = 0
+    results, failures = [], []
 
-    for item in ITEMS:
-        result = await predict_item(item['type_id'], item['name'])
-        if result:
-            results.append(result)
-            successful += 1
-        else:
-            failed += 1
+    for type_id in TRACKED_TYPE_IDS:
+        name = item_name(type_id)
+        print(f"\n--- {name} (type_id={type_id}) ---")
 
-    # Save summary
-    summary = {
-        'generated_at': datetime.now().isoformat(),
-        'total_items': len(ITEMS),
-        'successful': successful,
-        'failed': failed,
-        'items': results
-    }
+        if args.train:
+            try:
+                training = await train_item(
+                    type_id=type_id, region_id=region_id, epochs=args.epochs
+                )
+                print(f"  trained: val MAPE {training.metrics['val_mape']:.2f}%")
+            except InsufficientData as e:
+                print(f"  skipped: {e}")
+                failures.append({"type_id": type_id, "item_name": name, "error": str(e)})
+                continue
+            except Exception as e:
+                logger.exception(f"Training failed for {type_id}")
+                failures.append({"type_id": type_id, "item_name": name, "error": str(e)})
+                continue
 
-    summary_file = Path('data/predictions_summary.json')
-    with open(summary_file, 'w') as f:
-        json.dump(summary, f, indent=2)
+        try:
+            result = await generate_predictions(
+                type_id=type_id,
+                region_id=region_id,
+                horizon_days=args.days,
+                store=not args.no_store,
+            )
+        except (ModelNotTrained, InsufficientData) as e:
+            print(f"  skipped: {e}")
+            failures.append({"type_id": type_id, "item_name": name, "error": str(e)})
+            continue
+        except Exception as e:
+            logger.exception(f"Prediction failed for {type_id}")
+            failures.append({"type_id": type_id, "item_name": name, "error": str(e)})
+            continue
 
-    # Print summary
-    print("\n" + "="*80)
+        results.append(result)
+        print(f"  current:   {result['current_price']:>18,.0f} ISK")
+        print(f"  predicted: {result['predicted_price']:>18,.0f} ISK "
+              f"({result['percent_change']:+.2f}% over {result['horizon_days']}d)")
+
+        if args.json_dir:
+            out = Path(args.json_dir) / f"predictions_{name.lower().replace(' ', '_')}.json"
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(json.dumps(result, indent=2, default=str))
+
+    if args.json_dir:
+        summary = {
+            "generated_at": utcnow().isoformat(),
+            "region_id": region_id,
+            "total_items": len(TRACKED_TYPE_IDS),
+            "successful": len(results),
+            "failed": len(failures),
+            "items": results,
+            "failures": failures,
+        }
+        summary_file = Path(args.json_dir) / "predictions_summary.json"
+        summary_file.parent.mkdir(parents=True, exist_ok=True)
+        summary_file.write_text(json.dumps(summary, indent=2, default=str))
+        print(f"\nSummary written to {summary_file}")
+
+    print("\n" + "=" * 80)
     print("SUMMARY")
-    print("="*80)
-    print(f"Total items processed: {len(ITEMS)}")
-    print(f"Successful: {successful}")
-    print(f"Failed: {failed}")
-    print(f"\nSummary saved to: {summary_file}")
+    print("=" * 80)
+    print(f"Successful: {len(results)}   Failed: {len(failures)}")
 
     if results:
-        print("\nTop 5 Expected Gainers:")
-        sorted_by_gain = sorted(results, key=lambda x: x['percent_change'], reverse=True)[:5]
-        for i, item in enumerate(sorted_by_gain, 1):
-            print(f"{i}. {item['item_name']}: {item['percent_change']:+.2f}%")
+        ranked = sorted(results, key=lambda r: r["percent_change"], reverse=True)
+        print("\nTop expected gainers:")
+        for i, row in enumerate(ranked[:5], 1):
+            print(f"{i}. {row['item_name']}: {row['percent_change']:+.2f}%")
+        print("\nTop expected losers:")
+        for i, row in enumerate(sorted(results, key=lambda r: r["percent_change"])[:5], 1):
+            print(f"{i}. {row['item_name']}: {row['percent_change']:+.2f}%")
 
-        print("\nTop 5 Expected Losers:")
-        sorted_by_loss = sorted(results, key=lambda x: x['percent_change'])[:5]
-        for i, item in enumerate(sorted_by_loss, 1):
-            print(f"{i}. {item['item_name']}: {item['percent_change']:+.2f}%")
-
-    print("\n" + "="*80)
+    print("=" * 80)
+    return 0 if results else 1
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    sys.exit(asyncio.run(main()))

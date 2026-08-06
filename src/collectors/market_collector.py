@@ -1,105 +1,97 @@
 """Market data collector service"""
 
 import logging
-from datetime import datetime, timezone
-from typing import List
-from sqlalchemy import select
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional
 
-from src.config import settings
+from sqlalchemy import func, select
+
 from src.collectors.esi_client import ESIClient
-from src.database import get_session, MarketHistory, OrderSnapshot, Item
+from src.config import settings
+from src.constants import DEFAULT_REGION_ID, TRACKED_TYPE_IDS
+from src.database import Item, MarketHistory, MarketPrice, OrderSnapshot, get_session
+from src.database.upsert import bulk_upsert
+from src.utils.timeutils import parse_esi_datetime, utcnow
 
 logger = logging.getLogger(__name__)
 
 
 class MarketCollector:
-    """Collects market data from ESI API and stores in database"""
+    """Collects market data from ESI API and stores in database.
 
-    # Default items to track (high-liquidity items in Jita)
-    DEFAULT_TYPE_IDS = [
-        44992,   # PLEX
-        40519,   # Large Skill Injector
-        40520,   # Large Skill Extractor
-        34,      # Tritanium
-        35,      # Pyerite
-        36,      # Mexallon
-        37,      # Isogen
-        38,      # Nocxium
-        39,      # Zydrine
-        40,      # Megacyte
-        11399,   # Mercoxit
-    ]
+    The tracked item list lives in :mod:`src.constants` so the collector,
+    dashboard, drift detector and prediction scripts cannot disagree about
+    which type_id maps to which item.
+    """
 
-    # The Forge (Jita)
-    DEFAULT_REGION_ID = 10000002
+    DEFAULT_TYPE_IDS = TRACKED_TYPE_IDS
+    DEFAULT_REGION_ID = DEFAULT_REGION_ID
 
     def __init__(
         self,
-        region_id: int = DEFAULT_REGION_ID,
-        type_ids: List[int] = None,
+        region_ids: Optional[List[int]] = None,
+        type_ids: Optional[List[int]] = None,
     ):
-        self.region_id = region_id
-        self.type_ids = type_ids or self.DEFAULT_TYPE_IDS
+        self.region_ids = list(region_ids or settings.region_ids)
+        self.type_ids = list(type_ids or TRACKED_TYPE_IDS)
+
+    @property
+    def region_id(self) -> int:
+        """Primary region (first configured)."""
+        return self.region_ids[0]
 
     async def collect_historical_data(self):
         """
-        Collect historical market data for all tracked items
+        Collect historical market data for all tracked items and regions.
 
-        This fetches the last 365 days of daily statistics
+        ESI serves roughly the last year of daily statistics and refreshes it
+        once a day, so the scheduler runs this daily.
         """
         logger.info(
             f"Collecting historical data for {len(self.type_ids)} items "
-            f"in region {self.region_id}"
+            f"in regions {self.region_ids}"
         )
 
+        total_records = 0
+
         async with ESIClient() as client:
-            # Bulk fetch all historical data with rate limiting
-            history_data = await client.bulk_get_market_history(
-                self.region_id, self.type_ids
-            )
+            for region_id in self.region_ids:
+                history_data = await client.bulk_get_market_history(region_id, self.type_ids)
+                logger.info(f"Received history for {len(history_data)} items in {region_id}")
 
-            logger.info(f"Received history for {len(history_data)} items")
-
-            # Store in database
-            async with get_session() as session:
-                total_records = 0
-
+                rows = []
                 for type_id, history in history_data.items():
-                    if not history:
-                        continue
-
-                    records = []
-                    for day_data in history:
-                        # Convert date string to datetime (naive, no timezone)
+                    for day_data in history or []:
                         date_str = day_data.get("date")
                         if not date_str:
                             continue
-
-                        dt = datetime.fromisoformat(date_str)
-
-                        record = MarketHistory(
-                            time=dt,
-                            region_id=self.region_id,
-                            type_id=type_id,
-                            average=day_data.get("average"),
-                            highest=day_data.get("highest"),
-                            lowest=day_data.get("lowest"),
-                            volume=day_data.get("volume"),
-                            order_count=day_data.get("order_count"),
+                        rows.append(
+                            {
+                                "time": datetime.fromisoformat(date_str),
+                                "region_id": region_id,
+                                "type_id": type_id,
+                                "average": day_data.get("average"),
+                                "highest": day_data.get("highest"),
+                                "lowest": day_data.get("lowest"),
+                                "volume": day_data.get("volume"),
+                                "order_count": day_data.get("order_count"),
+                            }
                         )
-                        records.append(record)
 
-                    # Upsert records (insert or update)
-                    for record in records:
-                        await session.merge(record)
+                if not rows:
+                    continue
 
-                    total_records += len(records)
+                async with get_session() as session:
+                    written = await bulk_upsert(session, MarketHistory, rows)
+                    await session.commit()
 
-                    if total_records % 1000 == 0:
-                        logger.info(f"Stored {total_records} historical records...")
+                total_records += written
+                logger.info(f"Stored {written} history rows for region {region_id}")
 
-                await session.commit()
-                logger.info(f"Stored total of {total_records} historical records")
+            logger.info(f"ESI client stats: {client.get_stats()}")
+
+        logger.info(f"Stored total of {total_records} historical records")
+        return total_records
 
     async def collect_order_snapshots(self):
         """
@@ -107,98 +99,159 @@ class MarketCollector:
 
         Should be run every 5 minutes to match ESI cache
         """
-        snapshot_time = datetime.utcnow()  # Naive UTC datetime
+        snapshot_time = utcnow()
 
         logger.info(
             f"Collecting order snapshot at {snapshot_time} for "
-            f"{len(self.type_ids)} items"
+            f"{len(self.type_ids)} items in regions {self.region_ids}"
         )
 
+        total_orders = 0
+
         async with ESIClient() as client:
-            # Bulk fetch all order data
-            orders_data = await client.bulk_get_market_orders(
-                self.region_id, self.type_ids
-            )
+            for region_id in self.region_ids:
+                orders_data = await client.bulk_get_market_orders(region_id, self.type_ids)
+                logger.info(f"Received orders for {len(orders_data)} items in {region_id}")
 
-            logger.info(f"Received orders for {len(orders_data)} items")
-
-            # Store in database
-            async with get_session() as session:
-                total_orders = 0
-
+                rows = []
                 for type_id, orders in orders_data.items():
-                    if not orders:
-                        continue
-
-                    for order in orders:
-                        # Parse issued datetime (naive, no timezone)
-                        issued_str = order.get("issued")
-                        issued_dt = None
-                        if issued_str:
-                            # Remove timezone indicator and parse as naive datetime
-                            # ESI returns ISO format with 'Z' suffix like '2025-10-25T02:02:59Z'
-                            clean_str = issued_str.replace("Z", "")
-                            # Also handle +00:00 format if present
-                            if "+00:00" in clean_str:
-                                clean_str = clean_str.replace("+00:00", "")
-                            issued_dt = datetime.fromisoformat(clean_str)
-
-                        record = OrderSnapshot(
-                            snapshot_time=snapshot_time,
-                            order_id=order["order_id"],
-                            type_id=type_id,
-                            region_id=self.region_id,
-                            location_id=order["location_id"],
-                            price=order["price"],
-                            volume_remain=order["volume_remain"],
-                            volume_total=order["volume_total"],
-                            is_buy_order=order["is_buy_order"],
-                            duration=order.get("duration"),
-                            issued=issued_dt,
-                            min_volume=order.get("min_volume", 1),
-                            range=order.get("range"),
+                    for order in orders or []:
+                        rows.append(
+                            {
+                                "snapshot_time": snapshot_time,
+                                "order_id": order["order_id"],
+                                "type_id": type_id,
+                                "region_id": region_id,
+                                "location_id": order["location_id"],
+                                "price": order["price"],
+                                "volume_remain": order["volume_remain"],
+                                "volume_total": order["volume_total"],
+                                "is_buy_order": order["is_buy_order"],
+                                "duration": order.get("duration"),
+                                "issued": parse_esi_datetime(order.get("issued")),
+                                "min_volume": order.get("min_volume", 1),
+                                "range": order.get("range"),
+                            }
                         )
 
-                        session.add(record)
-                        total_orders += 1
+                if not rows:
+                    continue
 
-                await session.commit()
-                logger.info(f"Stored {total_orders} order snapshots")
+                # Upsert rather than plain insert: (snapshot_time, order_id) is
+                # the primary key, so a retried run updates instead of failing.
+                async with get_session() as session:
+                    written = await bulk_upsert(session, OrderSnapshot, rows)
+                    await session.commit()
 
-    async def update_item_metadata(self):
-        """Fetch and store item metadata (names, categories)"""
-        logger.info("Updating item metadata...")
+                total_orders += written
+
+            logger.info(f"ESI client stats: {client.get_stats()}")
+
+        logger.info(f"Stored {total_orders} order snapshots")
+        return total_orders
+
+    async def collect_reference_prices(self):
+        """Store universe-wide adjusted/average prices from ``/markets/prices/``.
+
+        These are CCP's own reference values, used for industry cost indices,
+        and are a useful sanity check against regional market prices.
+        """
+        collected_at = utcnow()
+        logger.info("Collecting ESI reference prices...")
 
         async with ESIClient() as client:
-            async with get_session() as session:
-                for type_id in self.type_ids:
-                    # Check if already in database
-                    result = await session.execute(
-                        select(Item).where(Item.type_id == type_id)
-                    )
-                    existing = result.scalar_one_or_none()
+            prices = await client.get_market_prices()
 
-                    if existing:
-                        logger.debug(f"Item {type_id} metadata already exists")
-                        continue
+        tracked = set(self.type_ids)
+        rows = [
+            {
+                "time": collected_at,
+                "type_id": entry["type_id"],
+                "adjusted_price": entry.get("adjusted_price"),
+                "average_price": entry.get("average_price"),
+            }
+            for entry in prices
+            if entry.get("type_id") in tracked
+        ]
 
-                    # Fetch from ESI
-                    info = await client.get_item_info(type_id)
-                    if not info:
-                        logger.warning(f"Could not fetch info for type_id {type_id}")
-                        continue
+        if not rows:
+            logger.warning("No reference prices returned for tracked items")
+            return 0
 
-                    item = Item(
-                        type_id=type_id,
-                        name=info.get("name", "Unknown"),
-                        category=str(info.get("group_id")) if info.get("group_id") else None,
-                        is_tradeable=info.get("published", True),
-                    )
+        async with get_session() as session:
+            written = await bulk_upsert(session, MarketPrice, rows)
+            await session.commit()
 
-                    session.add(item)
+        logger.info(f"Stored {written} reference prices")
+        return written
 
-                await session.commit()
-                logger.info(f"Updated metadata for {len(self.type_ids)} items")
+    async def update_item_metadata(self):
+        """Fetch and refresh item metadata (names, group and category names).
+
+        Unlike the previous skip-if-exists version this always refreshes, so
+        renames and newly resolved categories propagate.
+        """
+        logger.info("Updating item metadata...")
+
+        group_cache: Dict[int, Dict[str, Optional[str]]] = {}
+        rows = []
+
+        async with ESIClient() as client:
+            for type_id in self.type_ids:
+                info = await client.get_item_info(type_id)
+                if not info:
+                    logger.warning(f"Could not fetch info for type_id {type_id}")
+                    continue
+
+                group_id = info.get("group_id")
+                group_info = await self._resolve_group(client, group_id, group_cache)
+
+                rows.append(
+                    {
+                        "type_id": type_id,
+                        "name": info.get("name", "Unknown"),
+                        "group_id": group_id,
+                        "group_name": group_info.get("group_name"),
+                        "category": group_info.get("category_name"),
+                        "is_tradeable": info.get("published", True),
+                        "updated_at": utcnow(),
+                    }
+                )
+
+        if not rows:
+            return 0
+
+        async with get_session() as session:
+            written = await bulk_upsert(session, Item, rows)
+            await session.commit()
+
+        logger.info(f"Updated metadata for {written} items")
+        return written
+
+    @staticmethod
+    async def _resolve_group(
+        client: ESIClient,
+        group_id: Optional[int],
+        cache: Dict[int, Dict[str, Optional[str]]],
+    ) -> Dict[str, Optional[str]]:
+        """Resolve group_id -> (group name, category name), memoized per run."""
+        if not group_id:
+            return {"group_name": None, "category_name": None}
+        if group_id in cache:
+            return cache[group_id]
+
+        resolved: Dict[str, Optional[str]] = {"group_name": None, "category_name": None}
+        group = await client.get_group_info(group_id)
+        if group:
+            resolved["group_name"] = group.get("name")
+            category_id = group.get("category_id")
+            if category_id:
+                category = await client.get_category_info(category_id)
+                if category:
+                    resolved["category_name"] = category.get("name")
+
+        cache[group_id] = resolved
+        return resolved
 
     async def calculate_liquidity_tiers(self):
         """
@@ -208,13 +261,9 @@ class MarketCollector:
         """
         logger.info("Calculating liquidity tiers...")
 
+        thirty_days_ago = utcnow() - timedelta(days=30)
+
         async with get_session() as session:
-            # Get average daily volume for each item (last 30 days)
-            from sqlalchemy import func
-            from datetime import timedelta
-
-            thirty_days_ago = datetime.utcnow() - timedelta(days=30)
-
             for type_id in self.type_ids:
                 result = await session.execute(
                     select(
@@ -222,7 +271,7 @@ class MarketCollector:
                         func.avg(MarketHistory.order_count).label("avg_orders"),
                     )
                     .where(MarketHistory.type_id == type_id)
-                    .where(MarketHistory.region_id == self.region_id)
+                    .where(MarketHistory.region_id.in_(self.region_ids))
                     .where(MarketHistory.time >= thirty_days_ago)
                 )
 
@@ -241,11 +290,9 @@ class MarketCollector:
                 else:
                     tier = "low"
 
-                # Update item record
-                result = await session.execute(
-                    select(Item).where(Item.type_id == type_id)
-                )
-                item = result.scalar_one_or_none()
+                item = (
+                    await session.execute(select(Item).where(Item.type_id == type_id))
+                ).scalar_one_or_none()
 
                 if item:
                     item.liquidity_tier = tier

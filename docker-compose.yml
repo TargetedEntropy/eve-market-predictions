@@ -1,3 +1,17 @@
+# Infrastructure services (postgres, redis, mlflow) are reachable only on the
+# compose network or via 127.0.0.1 -- none of them have authentication worth
+# exposing on 0.0.0.0. DB_PASSWORD and REDIS_PASSWORD have no defaults on
+# purpose: compose refuses to start rather than silently using "changeme".
+
+x-app-environment: &app-environment
+  DATABASE_URL: postgresql+asyncpg://eve_user:${DB_PASSWORD:?DB_PASSWORD must be set}@postgres:5432/eve_markets
+  REDIS_URL: redis://:${REDIS_PASSWORD:?REDIS_PASSWORD must be set}@redis:6379/0
+  # Inside a container "localhost" is the container itself; every app service
+  # needs the compose hostname or MLflow logging hangs and then fails.
+  MLFLOW_TRACKING_URI: http://mlflow:5000
+  MODEL_DIR: /app/data/models
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
 services:
   # PostgreSQL with TimescaleDB
   postgres:
@@ -5,12 +19,13 @@ services:
     container_name: eve-postgres
     environment:
       POSTGRES_USER: eve_user
-      POSTGRES_PASSWORD: ${DB_PASSWORD:-changeme}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD must be set}
       POSTGRES_DB: eve_markets
     volumes:
       - postgres_data:/var/lib/postgresql/data
-    ports:
-      - "5432:5432"
+    # Uncomment to run psql from the host; keep it bound to loopback.
+    # ports:
+    #   - "127.0.0.1:5432:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U eve_user -d eve_markets"]
       interval: 10s
@@ -18,37 +33,42 @@ services:
       retries: 5
     restart: unless-stopped
 
-  # Redis
+  # Redis (ESI response/ETag cache)
   redis:
     image: redis:7-alpine
     container_name: eve-redis
-    ports:
-      - "6379:6379"
+    command: redis-server --requirepass ${REDIS_PASSWORD:?REDIS_PASSWORD must be set}
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD must be set}
     volumes:
       - redis_data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
       interval: 10s
       timeout: 3s
       retries: 5
     restart: unless-stopped
 
-  # Data Collector Daemon
+  # Data Collector Daemon (also where you run the training/prediction scripts)
   collector:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: eve-collector
     command: python scripts/scheduler_daemon.py
-    environment:
-      DATABASE_URL: postgresql+asyncpg://eve_user:${DB_PASSWORD:-changeme}@postgres:5432/eve_markets
-      REDIS_URL: redis://redis:6379/0
-      LOG_LEVEL: INFO
+    environment: *app-environment
+    volumes:
+      # Without this, models/predictions/drift reports written by scripts run
+      # in this container land on ephemeral storage and the api service never
+      # sees a trained model.
+      - ./data:/app/data
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+      mlflow:
+        condition: service_started
     restart: unless-stopped
 
   # FastAPI Server
@@ -59,12 +79,10 @@ services:
     container_name: eve-api
     command: uvicorn src.api.main:app --host 0.0.0.0 --port 8000
     ports:
-      - "8000:8000"
+      - "${API_BIND:-127.0.0.1}:8000:8000"
     environment:
-      DATABASE_URL: postgresql+asyncpg://eve_user:${DB_PASSWORD:-changeme}@postgres:5432/eve_markets
-      REDIS_URL: redis://redis:6379/0
-      MODEL_PATH: /app/data/models/best_model.pth
-      LOG_LEVEL: INFO
+      <<: *app-environment
+      API_CORS_ORIGINS: ${API_CORS_ORIGINS:-http://localhost:8050}
     volumes:
       - ./data:/app/data
     depends_on:
@@ -72,9 +90,19 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      mlflow:
+        condition: service_started
+    healthcheck:
+      # /health returns 503 until a model is loadable, so this stays unhealthy
+      # on a non-functional API instead of reporting success.
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=5).status==200 else 1)\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
     restart: unless-stopped
 
-  # MLflow Tracking Server
+  # MLflow Tracking Server (no authentication -- loopback only)
   mlflow:
     image: ghcr.io/mlflow/mlflow:v2.17.0
     container_name: eve-mlflow
@@ -85,29 +113,42 @@ services:
       --backend-store-uri sqlite:///mlflow/mlflow.db
       --default-artifact-root /mlflow/artifacts
     ports:
-      - "5000:5000"
+      - "127.0.0.1:5000:5000"
     volumes:
       - mlflow_data:/mlflow
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:5000/health', timeout=5).status==200 else 1)\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
     restart: unless-stopped
 
-  # Dashboard
+  # Dashboard (gunicorn, never the Werkzeug debug server)
   dashboard:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: eve-dashboard
-    command: python src/dashboard/app.py
+    command: gunicorn --bind 0.0.0.0:8050 --workers 2 --timeout 120 src.dashboard.app:server
     ports:
-      - "8050:8050"
+      - "${DASHBOARD_BIND:-127.0.0.1}:8050:8050"
     environment:
-      DATABASE_URL: postgresql+asyncpg://eve_user:${DB_PASSWORD:-changeme}@postgres:5432/eve_markets
-      REDIS_URL: redis://redis:6379/0
-      LOG_LEVEL: INFO
+      <<: *app-environment
+      DASHBOARD_DEBUG: "False"
+    volumes:
+      - ./data:/app/data
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8050/', timeout=5).status==200 else 1)\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
     restart: unless-stopped
 
 volumes:

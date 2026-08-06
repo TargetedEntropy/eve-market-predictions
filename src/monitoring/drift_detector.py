@@ -1,24 +1,36 @@
-"""Model drift detection using Evidently AI"""
+"""Data and model drift detection using Evidently AI.
 
+Two different things are reported and should not be confused:
+
+* **Data drift** -- the input distribution (volume, spread, returns) moved.
+* **Prediction error** -- how wrong the model's scored predictions actually
+  were, from ``model_performance``/``predictions``. This is the signal that
+  justifies retraining; it only exists once the evaluation job has run.
+"""
+
+import json
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional, Dict, List, Tuple
-import json
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
-import numpy as np
 from evidently import ColumnMapping
-from evidently.report import Report
 from evidently.metric_preset import DataDriftPreset, TargetDriftPreset
 from evidently.metrics import (
     DatasetDriftMetric,
     DatasetMissingValuesMetric,
-    ColumnDriftMetric,
 )
+from evidently.report import Report
 from sqlalchemy import select
 
-from src.database import get_session, MarketHistory, Prediction
+from src.config import settings
+from src.database import MarketHistory, get_session
+from src.monitoring.evaluation import recent_prediction_error
+from src.utils.timeutils import utcnow
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -34,6 +46,10 @@ class DriftReport:
     drifted_features: List[str]
     metrics: Dict[str, float]
     report_path: Optional[str] = None
+    #: MAPE of recently scored 1-day predictions, once the evaluation job has
+    #: filled in actual prices. None until predictions have been scored.
+    prediction_mape: Optional[float] = None
+    reference_prediction_mape: Optional[float] = None
 
     def to_dict(self) -> dict:
         """Convert to dictionary"""
@@ -47,6 +63,8 @@ class DriftReport:
             'drifted_features': self.drifted_features,
             'metrics': self.metrics,
             'report_path': self.report_path,
+            'prediction_mape': self.prediction_mape,
+            'reference_prediction_mape': self.reference_prediction_mape,
         }
 
 
@@ -57,7 +75,7 @@ class DriftDetector:
         self,
         reference_window_days: int = 30,
         current_window_days: int = 7,
-        drift_threshold: float = 0.5,
+        drift_threshold: Optional[float] = None,
     ):
         """
         Initialize drift detector
@@ -69,7 +87,9 @@ class DriftDetector:
         """
         self.reference_window_days = reference_window_days
         self.current_window_days = current_window_days
-        self.drift_threshold = drift_threshold
+        self.drift_threshold = (
+            settings.drift_threshold if drift_threshold is None else drift_threshold
+        )
 
     async def detect_drift(
         self,
@@ -94,7 +114,7 @@ class DriftDetector:
 
         if reference_data.empty or current_data.empty:
             return DriftReport(
-                timestamp=datetime.now(),
+                timestamp=utcnow(),
                 type_id=type_id,
                 region_id=region_id,
                 data_drift_detected=False,
@@ -144,8 +164,24 @@ class DriftDetector:
                 report, type_id, region_id
             )
 
+        # Realized prediction error, when the evaluation job has scored any.
+        # Evidently's "target drift" above is drift of the *price* itself; this
+        # is the model's own error, which is what actually motivates retraining.
+        prediction_mape = await recent_prediction_error(
+            type_id, region_id, window_days=self.current_window_days
+        )
+        reference_mape = await recent_prediction_error(
+            type_id,
+            region_id,
+            window_days=self.current_window_days + self.reference_window_days,
+        )
+        if prediction_mape is not None:
+            drift_metrics['prediction_mape'] = prediction_mape
+        if reference_mape is not None:
+            drift_metrics['reference_prediction_mape'] = reference_mape
+
         return DriftReport(
-            timestamp=datetime.now(),
+            timestamp=utcnow(),
             type_id=type_id,
             region_id=region_id,
             data_drift_detected=drift_metrics['data_drift_detected'],
@@ -154,13 +190,15 @@ class DriftDetector:
             drifted_features=drift_metrics['drifted_features'],
             metrics=drift_metrics,
             report_path=report_path,
+            prediction_mape=prediction_mape,
+            reference_prediction_mape=reference_mape,
         )
 
     async def _get_reference_data(
         self, type_id: int, region_id: int
     ) -> pd.DataFrame:
         """Get reference (baseline) data"""
-        end_date = datetime.now() - timedelta(days=self.current_window_days)
+        end_date = utcnow() - timedelta(days=self.current_window_days)
         start_date = end_date - timedelta(days=self.reference_window_days)
 
         async with get_session() as session:
@@ -187,7 +225,7 @@ class DriftDetector:
         self, type_id: int, region_id: int
     ) -> pd.DataFrame:
         """Get current (recent) data"""
-        end_date = datetime.now()
+        end_date = utcnow()
         start_date = end_date - timedelta(days=self.current_window_days)
 
         async with get_session() as session:
@@ -280,7 +318,7 @@ class DriftDetector:
         reports_dir = Path('data/drift_reports')
         reports_dir.mkdir(parents=True, exist_ok=True)
 
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        timestamp = utcnow().strftime('%Y%m%d_%H%M%S')
         filename = f'drift_report_{type_id}_{region_id}_{timestamp}.html'
         filepath = reports_dir / filename
 
@@ -312,9 +350,21 @@ class DriftDetector:
                     region_id=region_id,
                     save_report=save_reports,
                 )
-                reports.append(report)
             except Exception as e:
-                print(f"Error checking drift for {type_id}/{region_id}: {e}")
+                logger.exception(f"Error checking drift for {type_id}/{region_id}: {e}")
+                # Keep one report per requested item so callers can zip the two
+                # lists together without silently misaligning them.
+                report = DriftReport(
+                    timestamp=utcnow(),
+                    type_id=type_id,
+                    region_id=region_id,
+                    data_drift_detected=False,
+                    prediction_drift_detected=False,
+                    drift_score=0.0,
+                    drifted_features=[],
+                    metrics={'error': str(e)},
+                )
+            reports.append(report)
 
         return reports
 
@@ -323,7 +373,7 @@ class DriftDetector:
     ):
         """Save drift detection summary to JSON"""
         summary = {
-            'timestamp': datetime.now().isoformat(),
+            'timestamp': utcnow().isoformat(),
             'total_items': len(reports),
             'items_with_drift': sum(1 for r in reports if r.data_drift_detected),
             'items_with_target_drift': sum(1 for r in reports if r.prediction_drift_detected),
@@ -336,6 +386,12 @@ class DriftDetector:
         with open(output, 'w') as f:
             json.dump(summary, f, indent=2)
 
-        print(f"Drift summary saved to: {output}")
-        print(f"Items with data drift: {summary['items_with_drift']}/{summary['total_items']}")
-        print(f"Items with target drift: {summary['items_with_target_drift']}/{summary['total_items']}")
+        logger.info(f"Drift summary saved to: {output}")
+        logger.info(
+            f"Items with data drift: {summary['items_with_drift']}/{summary['total_items']}"
+        )
+        logger.info(
+            f"Items with target drift: "
+            f"{summary['items_with_target_drift']}/{summary['total_items']}"
+        )
+        return summary

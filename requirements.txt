@@ -4,7 +4,7 @@ python-dotenv==1.0.1
 # Web Framework
 fastapi==0.115.0
 uvicorn[standard]==0.32.0
-gunicorn==21.2.0
+gunicorn==21.2.0        # serves the Dash dashboard in the container
 pydantic==2.9.0
 pydantic-settings==2.5.0
 
@@ -16,7 +16,7 @@ sqlalchemy[asyncio]==2.0.25
 asyncpg==0.29.0
 
 # Caching & Rate Limiting
-redis[hiredis]==5.0.1
+redis[hiredis]==5.0.1   # ESI response/ETag cache (src/utils/cache.py)
 aiometer==0.5.0
 
 # ML & Deep Learning
@@ -27,14 +27,11 @@ scikit-learn==1.4.0
 
 # Data Processing
 pandas==2.2.0
-ta==0.11.0  # Technical Analysis library (alternative to pandas-ta)
+ta==0.11.0              # the only technical-analysis library used
 
 # MLOps
 mlflow==2.17.0
 evidently==0.4.34
-
-# Backtesting
-vectorbt==0.26.0
 
 # Task Scheduling
 apscheduler==3.10.4
@@ -43,8 +40,6 @@ apscheduler==3.10.4
 plotly==5.24.0
 dash==2.18.0
 dash-bootstrap-components==1.6.0
-matplotlib==3.9.0
-seaborn==0.13.2
 
 # Development
 pytest==8.3.0
@@ -52,3 +47,9 @@ pytest-asyncio==0.24.0
 pytest-cov==6.0.0
 black==24.10.0
 ruff==0.7.0
+
+# Removed deliberately (no imports anywhere; they only inflated the image):
+#   vectorbt   - backtesting was documented but never implemented
+#   matplotlib - plotting is done with plotly
+#   seaborn    - same
+#   pandas-ta  - superseded by `ta`; the dead code path has been deleted
