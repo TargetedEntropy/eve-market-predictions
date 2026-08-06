@@ -1,200 +1,262 @@
 #!/usr/bin/env python3
-"""Import market history from EVE Ref CSV files"""
+"""Import historical market data from EVE Ref's daily CSV dumps.
 
+https://data.everef.net/market-history/ is a community-run mirror, so downloads
+are paced, retried with backoff, and a missing file (e.g. a future date) is
+skipped rather than treated as an error.
+
+Region filtering is explicit: by default only ``COLLECTION_REGION_IDS`` is
+imported. Pass ``--all-regions`` to load every region present in the dumps --
+useful if you want the dashboard's Amarr/Dodixie options to have data, but it
+is a lot more rows.
+
+Examples::
+
+    python scripts/import_everef_data.py --days 90
+    python scripts/import_everef_data.py --start 2025-01-01 --end 2025-03-31
+    python scripts/import_everef_data.py --days 30 --all-regions
+    python scripts/import_everef_data.py --days 30 --all-items
+"""
+
+import argparse
 import asyncio
-import sys
-import logging
 import bz2
+import logging
+import sys
+from datetime import date, datetime, timedelta
 from pathlib import Path
-from datetime import datetime, timedelta
-from typing import List
+from typing import List, Optional
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-import pandas as pd
 import httpx
-from sqlalchemy import select
+import pandas as pd
 
 from src.config import settings
-from src.database import get_session, MarketHistory
+from src.constants import TRACKED_TYPE_IDS
+from src.database import MarketHistory, get_session
+from src.database.upsert import bulk_upsert
+from src.utils.timeutils import utcnow
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 BASE_URL = "https://data.everef.net/market-history"
 
-
-async def download_file(url: str, output_path: Path) -> bool:
-    """Download a file from URL"""
-    try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.get(url)
-            response.raise_for_status()
-
-            output_path.write_bytes(response.content)
-            logger.info(f"Downloaded {url} -> {output_path}")
-            return True
-    except Exception as e:
-        logger.error(f"Failed to download {url}: {e}")
-        return False
+CSV_COLUMNS = ["date", "region_id", "type_id", "average", "highest", "lowest",
+               "volume", "order_count"]
 
 
-async def import_csv_file(csv_path: Path, target_type_ids: List[int] = None):
-    """Import market history from CSV file"""
-    logger.info(f"Importing {csv_path}...")
+async def download_file(
+    url: str,
+    output_path: Path,
+    retries: int = 3,
+    delay: float = 1.0,
+) -> bool:
+    """Download a file, retrying transient failures. 404 means "not published"."""
+    for attempt in range(retries + 1):
+        try:
+            async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
+                response = await client.get(url)
 
-    # Read CSV
-    df = pd.read_csv(csv_path)
-    logger.info(f"Loaded {len(df)} records from CSV")
+                if response.status_code == 404:
+                    logger.info(f"Not published yet: {url}")
+                    return False
 
-    # Filter by type_ids if specified
-    if target_type_ids:
-        df = df[df['type_id'].isin(target_type_ids)]
-        logger.info(f"Filtered to {len(df)} records for target items")
+                response.raise_for_status()
+                output_path.write_bytes(response.content)
+                logger.info(f"Downloaded {url} -> {output_path.name}")
+                return True
 
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code < 500 or attempt >= retries:
+                logger.error(f"Failed to download {url}: {e}")
+                return False
+        except Exception as e:
+            if attempt >= retries:
+                logger.error(f"Failed to download {url}: {e}")
+                return False
+
+        backoff = delay * (2 ** attempt)
+        logger.warning(f"Retrying {url} in {backoff:.1f}s")
+        await asyncio.sleep(backoff)
+
+    return False
+
+
+def read_and_filter_csv(
+    csv_path: Path,
+    type_ids: Optional[List[int]],
+    region_ids: Optional[List[int]],
+) -> pd.DataFrame:
+    """Read a daily dump, filtering before any objects are built.
+
+    The dumps hold every region and every item; filtering during the read keeps
+    memory bounded and avoids constructing rows that are about to be dropped.
+    """
+    frames = []
+    for chunk in pd.read_csv(csv_path, chunksize=200_000):
+        if type_ids is not None:
+            chunk = chunk[chunk["type_id"].isin(type_ids)]
+        if region_ids is not None:
+            chunk = chunk[chunk["region_id"].isin(region_ids)]
+        if not chunk.empty:
+            frames.append(chunk)
+
+    if not frames:
+        return pd.DataFrame(columns=CSV_COLUMNS)
+
+    return pd.concat(frames, ignore_index=True)
+
+
+async def import_csv_file(
+    csv_path: Path,
+    type_ids: Optional[List[int]] = None,
+    region_ids: Optional[List[int]] = None,
+) -> int:
+    """Bulk-upsert one daily CSV into ``market_history``."""
+    logger.info(f"Importing {csv_path.name}...")
+
+    df = read_and_filter_csv(csv_path, type_ids, region_ids)
     if df.empty:
-        logger.warning("No records to import after filtering")
+        logger.info("  nothing to import after filtering")
         return 0
 
-    # Convert date strings to datetime
-    df['time'] = pd.to_datetime(df['date'])
+    df["time"] = pd.to_datetime(df["date"])
 
-    # Import to database
+    rows = [
+        {
+            "time": record["time"].to_pydatetime(),
+            "region_id": int(record["region_id"]),
+            "type_id": int(record["type_id"]),
+            "average": record["average"],
+            "highest": record["highest"],
+            "lowest": record["lowest"],
+            "volume": int(record["volume"]),
+            "order_count": int(record["order_count"]),
+        }
+        for record in df.to_dict("records")
+    ]
+
+    # One statement per 1000 rows, instead of a SELECT per row.
     async with get_session() as session:
-        records_added = 0
-        records_updated = 0
-
-        for _, row in df.iterrows():
-            # Check if record exists
-            result = await session.execute(
-                select(MarketHistory).where(
-                    MarketHistory.time == row['time'],
-                    MarketHistory.region_id == row['region_id'],
-                    MarketHistory.type_id == row['type_id']
-                )
-            )
-            existing = result.scalar_one_or_none()
-
-            if existing:
-                # Update existing record
-                existing.average = row['average']
-                existing.highest = row['highest']
-                existing.lowest = row['lowest']
-                existing.volume = row['volume']
-                existing.order_count = row['order_count']
-                records_updated += 1
-            else:
-                # Create new record
-                record = MarketHistory(
-                    time=row['time'],
-                    region_id=row['region_id'],
-                    type_id=row['type_id'],
-                    average=row['average'],
-                    highest=row['highest'],
-                    lowest=row['lowest'],
-                    volume=row['volume'],
-                    order_count=row['order_count']
-                )
-                session.add(record)
-                records_added += 1
-
-            # Commit in batches
-            if (records_added + records_updated) % 1000 == 0:
-                await session.commit()
-                logger.info(f"Progress: {records_added} added, {records_updated} updated")
-
+        written = await bulk_upsert(session, MarketHistory, rows)
         await session.commit()
 
-    logger.info(f"Import complete: {records_added} added, {records_updated} updated")
-    return records_added + records_updated
+    logger.info(f"  upserted {written} rows")
+    return written
 
 
 async def import_date_range(
-    start_date: datetime,
-    end_date: datetime,
-    target_type_ids: List[int] = None,
-    download_dir: Path = None
-):
-    """Download and import market history for a date range"""
-    if download_dir is None:
-        download_dir = Path("data/raw")
-
+    start_date: date,
+    end_date: date,
+    type_ids: Optional[List[int]] = None,
+    region_ids: Optional[List[int]] = None,
+    download_dir: Optional[Path] = None,
+    pause_seconds: float = 0.5,
+    keep_files: bool = False,
+) -> int:
+    """Download and import every daily dump in ``[start_date, end_date]``."""
+    download_dir = download_dir or Path("data/raw")
     download_dir.mkdir(parents=True, exist_ok=True)
 
-    current_date = start_date
-    total_records = 0
+    current = start_date
+    total = 0
 
-    while current_date <= end_date:
-        date_str = current_date.strftime("%Y-%m-%d")
-        year = current_date.year
+    while current <= end_date:
+        date_str = current.strftime("%Y-%m-%d")
+        bz2_path = download_dir / f"market-history-{date_str}.csv.bz2"
+        csv_path = download_dir / f"market-history-{date_str}.csv"
+        url = f"{BASE_URL}/{current.year}/{bz2_path.name}"
 
-        # Construct URLs
-        bz2_filename = f"market-history-{date_str}.csv.bz2"
-        csv_filename = f"market-history-{date_str}.csv"
-
-        bz2_path = download_dir / bz2_filename
-        csv_path = download_dir / csv_filename
-
-        url = f"{BASE_URL}/{year}/{bz2_filename}"
-
-        # Download if not exists
         if not bz2_path.exists() and not csv_path.exists():
-            logger.info(f"Downloading {date_str}...")
-            success = await download_file(url, bz2_path)
-            if not success:
-                logger.warning(f"Skipping {date_str}")
-                current_date += timedelta(days=1)
+            if not await download_file(url, bz2_path):
+                current += timedelta(days=1)
+                # Be polite to a community mirror even when skipping.
+                await asyncio.sleep(pause_seconds)
                 continue
 
-        # Decompress if needed
         if not csv_path.exists() and bz2_path.exists():
-            logger.info(f"Decompressing {bz2_filename}...")
-            with bz2.open(bz2_path, 'rb') as f_in:
-                with open(csv_path, 'wb') as f_out:
-                    f_out.write(f_in.read())
+            logger.info(f"Decompressing {bz2_path.name}...")
+            with bz2.open(bz2_path, "rb") as source, open(csv_path, "wb") as target:
+                for block in iter(lambda: source.read(1 << 20), b""):
+                    target.write(block)
 
-        # Import
         if csv_path.exists():
-            count = await import_csv_file(csv_path, target_type_ids)
-            total_records += count
+            total += await import_csv_file(csv_path, type_ids, region_ids)
+            if not keep_files:
+                csv_path.unlink(missing_ok=True)
+                bz2_path.unlink(missing_ok=True)
 
-        current_date += timedelta(days=1)
+        current += timedelta(days=1)
+        await asyncio.sleep(pause_seconds)
 
-    logger.info(f"Total records imported: {total_records}")
-    return total_records
+    logger.info(f"Total rows imported: {total}")
+    return total
 
 
-async def main():
-    """Main import function"""
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    window = parser.add_mutually_exclusive_group()
+    window.add_argument("--days", type=int, default=90,
+                        help="Import the last N days (default: 90)")
+    window.add_argument("--start", type=str, help="Start date YYYY-MM-DD")
+
+    parser.add_argument("--end", type=str, help="End date YYYY-MM-DD (default: today)")
+    parser.add_argument("--type-id", type=int, action="append", dest="type_ids",
+                        help="Item to import (repeatable; default: tracked items)")
+    parser.add_argument("--all-items", action="store_true",
+                        help="Import every item (very large)")
+    parser.add_argument("--region-id", type=int, action="append", dest="region_ids",
+                        help="Region to import (repeatable; default: COLLECTION_REGION_IDS)")
+    parser.add_argument("--all-regions", action="store_true",
+                        help="Import every region present in the dumps")
+    parser.add_argument("--download-dir", default="data/raw")
+    parser.add_argument("--keep-files", action="store_true",
+                        help="Keep downloaded .csv/.bz2 files instead of deleting them")
+    parser.add_argument("--pause", type=float, default=0.5,
+                        help="Seconds to wait between daily files")
+    return parser.parse_args(argv)
+
+
+async def main(argv=None):
+    args = parse_args(argv)
+
+    end_date = datetime.strptime(args.end, "%Y-%m-%d").date() if args.end \
+        else utcnow().date()
+    if args.start:
+        start_date = datetime.strptime(args.start, "%Y-%m-%d").date()
+    else:
+        start_date = end_date - timedelta(days=args.days)
+
+    if start_date > end_date:
+        logger.error("--start must be on or before --end")
+        return 1
+
+    type_ids = None if args.all_items else (args.type_ids or TRACKED_TYPE_IDS)
+    region_ids = None if args.all_regions else (args.region_ids or settings.region_ids)
+
     logger.info("EVE Ref Market Data Importer")
     logger.info("=" * 50)
+    logger.info(f"Date range: {start_date} .. {end_date}")
+    logger.info(f"Items:      {'ALL' if type_ids is None else len(type_ids)}")
+    logger.info(f"Regions:    {'ALL' if region_ids is None else region_ids}")
 
-    # Target items (same as our tracked items)
-    target_type_ids = [
-        44992,  # PLEX
-        40519,  # Skill Extractor
-        40520,  # Large Skill Injector
-        34,     # Tritanium
-        35,     # Pyerite
-        36,     # Mexallon
-        37,     # Isogen
-        38,     # Nocxium
-        39,     # Zydrine
-        40,     # Megacyte
-        11399,  # Morphite
-    ]
-
-    # Import last 90 days of data
-    end_date = datetime.now()
-    start_date = end_date - timedelta(days=90)
-
-    logger.info(f"Importing data from {start_date.date()} to {end_date.date()}")
-    logger.info(f"Target items: {len(target_type_ids)}")
-
-    await import_date_range(start_date, end_date, target_type_ids)
+    await import_date_range(
+        start_date,
+        end_date,
+        type_ids=type_ids,
+        region_ids=region_ids,
+        download_dir=Path(args.download_dir),
+        pause_seconds=args.pause,
+        keep_files=args.keep_files,
+    )
 
     logger.info("Import complete!")
+    return 0
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    sys.exit(asyncio.run(main()))

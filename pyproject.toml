@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "eve-discovery"
+version = "0.2.0"
+description = "EVE Online market data mining and LSTM price prediction"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+
+[tool.setuptools]
+packages = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# pytest-asyncio: async test functions do not need an explicit marker
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+addopts = "-q --strict-markers"
+filterwarnings = [
+    "ignore::DeprecationWarning:mlflow.*",
+    "ignore::UserWarning:torch.*",
+]
+markers = [
+    "integration: needs a live PostgreSQL/TimescaleDB instance",
+]
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]

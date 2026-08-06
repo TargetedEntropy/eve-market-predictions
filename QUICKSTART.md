@@ -1,161 +1,121 @@
-# Quick Start Guide - Fixed Installation
+# Quick Start Guide
 
-## ✅ Working Installation (No Issues)
+From nothing to a served prediction. See `README.md` for the full reference and
+`SETUP_GUIDE.md` for a step-by-step walkthrough.
 
-### Option 1: Docker (RECOMMENDED - Zero Issues!)
+## Option 1: Docker (recommended)
 
 ```bash
-# 1. Setup
 cd eve-discovery
 cp .env.example .env
-nano .env  # Change DB_PASSWORD
 
-# 2. Start everything
+# DB_PASSWORD and REDIS_PASSWORD are REQUIRED -- compose refuses to start
+# without them (there is no "changeme" default).
+nano .env
+
 docker compose up -d
 
-# 3. Initialize
+# Tables, hypertables, compression and retention policies
 docker compose exec api python scripts/init_database.py
+
+# Item metadata, market history, an order snapshot and reference prices
 docker compose exec collector python scripts/collect_data.py
 
-# 4. Done! Access at:
-# http://localhost:8000/docs
+# One model per tracked item, then forecasts
+docker compose exec collector python scripts/train_model.py --all
+docker compose exec collector python scripts/predict_all_items.py
 ```
 
-### Option 2: Local Installation (Fixed)
+Then open:
+
+| Service | URL |
+|---------|-----|
+| Dashboard | http://localhost:8050 |
+| API docs | http://localhost:8000/docs |
+| MLflow | http://localhost:5000 |
+
+All ports bind to `127.0.0.1`. Set `API_BIND=0.0.0.0` / `DASHBOARD_BIND=0.0.0.0`
+to expose them -- neither service authenticates, so put a proxy in front first.
+
+## Option 2: Local installation
 
 ```bash
-# 1. Create virtual environment
 python3.11 -m venv venv
 source venv/bin/activate
-
-# 2. Install dependencies (FIXED VERSION)
 pip install --upgrade pip
-
-# Install core packages
 pip install -r requirements.txt
 
-# 3. Setup database (requires PostgreSQL + TimescaleDB)
+cp .env.example .env   # point DATABASE_URL at your PostgreSQL
+
+# Requires PostgreSQL 15+ with the TimescaleDB extension.
+# Add --allow-missing-timescaledb to run on plain PostgreSQL (no hypertables,
+# no compression, no retention).
 python scripts/init_database.py
 
-# 4. Collect data
 python scripts/collect_data.py
+python scripts/train_model.py --all
+python scripts/predict_all_items.py
 
-# 5. Run API
 uvicorn src.api.main:app --reload
 ```
 
-## 🔧 What Was Fixed
-
-### Issue: pandas-ta not found
-**Solution:** Replaced with `ta` library (more reliable)
-
-### Changes Made:
-1. **requirements.txt** - Now uses `ta==0.11.0` instead of pandas-ta
-2. **src/features/technical_indicators_alt.py** - New implementation with fallback support
-3. Works with either library automatically!
-
-## 📦 Installation Options
-
-### Minimal Working Installation
+## Verify the installation
 
 ```bash
-# Just the essentials
-pip install fastapi uvicorn sqlalchemy asyncpg redis httpx
-pip install torch pandas numpy scikit-learn
-pip install ta  # Technical indicators (working package!)
-pip install mlflow apscheduler
-```
-
-### Full Installation
-
-```bash
-# Everything
-pip install -r requirements.txt
-```
-
-### From GitHub (pandas-ta if you prefer)
-
-```bash
-# Use pandas-ta from GitHub instead
-pip install git+https://github.com/twopirllc/pandas-ta.git
-```
-
-## 🎯 What Works Now
-
-✅ All packages install without errors
-✅ Technical indicators work with `ta` library
-✅ Backward compatible with pandas-ta if installed
-✅ Docker works perfectly (no changes needed)
-
-## 🚀 Test Your Installation
-
-```bash
-# Test imports
 python -c "
-import fastapi
-import torch
-import pandas
-import ta
-import sqlalchemy
-print('✅ All packages working!')
+import fastapi, torch, pandas, ta, sqlalchemy, redis
+print('packages OK')
 "
 
-# Test technical indicators
 python -c "
-from src.features.technical_indicators_alt import TechnicalIndicators
-print('✅ Technical indicators working!')
+import pandas as pd, numpy as np
+from src.features.technical_indicators import TechnicalIndicators, INDICATOR_COLUMNS
+df = pd.DataFrame({'average': np.linspace(100, 200, 120)})
+df['volume'] = 1000
+out = TechnicalIndicators.compute_all(df)
+print(f'technical indicators OK ({len(INDICATOR_COLUMNS)} columns)')
 "
+
+pytest -q
 ```
 
-## 📖 Updated Files
+## Backfill historical data
 
-1. **requirements.txt** - Uses `ta` library now
-2. **src/features/technical_indicators_alt.py** - New implementation
-3. **Original files still work** - Backward compatible!
-
-## 🐳 Docker (Still the Easiest)
-
-Docker installation is **unchanged** and works perfectly:
+ESI only serves about a year of daily history. For more, import EVE Ref's dumps:
 
 ```bash
-docker compose up -d
+python scripts/import_everef_data.py --days 365
+python scripts/import_everef_data.py --start 2023-01-01 --end 2023-12-31
 ```
 
-That's it! No dependency issues with Docker.
-
-## 💡 Tips
-
-1. **Use Docker** if you want zero hassle
-2. **Local installation** now works with fixed requirements
-3. The `ta` library provides same indicators as pandas-ta
-4. Code automatically detects which library is available
-
-## 🆘 Still Having Issues?
+## First prediction
 
 ```bash
-# Nuclear option - fresh start
-rm -rf venv
-python3.11 -m venv venv
-source venv/bin/activate
-pip install --upgrade pip
-pip install -r requirements.txt
-
-# Or just use Docker!
-docker compose up -d
+curl -X POST http://localhost:8000/predict \
+  -H "Content-Type: application/json" \
+  -d '{"type_id": 44992, "horizon_days": 7}'
 ```
 
-## ✨ You're Ready!
+`/health` and `/predict` return **503** until a model exists for the requested
+item -- train one first.
 
-Start the system:
-```bash
-# Docker
-docker compose up -d
+## Troubleshooting
 
-# Or Local
-python scripts/scheduler_daemon.py  # Terminal 1
-uvicorn src.api.main:app --reload   # Terminal 2
-```
+**`/health` returns 503 with `models_loaded: 0`**
+No checkpoint in `MODEL_DIR`. Run `python scripts/train_model.py --all`. In
+Docker, confirm both `api` and `collector` mount `./data:/app/data`.
 
-Access at: **http://localhost:8000/docs**
+**`TimescaleDBUnavailable` on init**
+The extension is not installed on your PostgreSQL server. Install it, or re-run
+with `--allow-missing-timescaledb` and accept plain tables.
 
-Happy trading! 🚀
+**Compose refuses to start**
+`DB_PASSWORD` or `REDIS_PASSWORD` is unset in `.env`. That is deliberate.
+
+**`ValueError` from the scheduler on `RETRAINING_DAY`**
+Fixed: full day names (`sunday`) are now normalized to `sun`. Anything that is
+not a day at all is rejected at startup with a clear message.
+
+**ESI 420 / error limit**
+The client pauses all in-flight work until the error window resets and retries
+with backoff. If it happens constantly, lower `ESI_RATE_LIMIT`.

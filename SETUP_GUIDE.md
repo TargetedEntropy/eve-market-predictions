@@ -75,10 +75,14 @@ Expected output:
 NAME              STATUS          PORTS
 eve-postgres      Up (healthy)    5432/tcp
 eve-redis         Up (healthy)    6379/tcp
-eve-api           Up              0.0.0.0:8000->8000/tcp
+eve-api           Up (healthy)    127.0.0.1:8000->8000/tcp
 eve-collector     Up
-eve-mlflow        Up              0.0.0.0:5000->5000/tcp
+eve-mlflow        Up (healthy)    127.0.0.1:5000->5000/tcp
+eve-dashboard     Up (healthy)    127.0.0.1:8050->8050/tcp
 ```
+
+Six services. Postgres and Redis are not published to the host at all; the
+other three bind to loopback (override with `API_BIND` / `DASHBOARD_BIND`).
 
 ### Step 3: Initialize Database
 
@@ -125,15 +129,22 @@ open http://localhost:5000
 ### Step 6: Access Services
 
 - **API Documentation**: http://localhost:8000/docs
+- **Dashboard**: http://localhost:8050
 - **MLflow Tracking**: http://localhost:5000
-- **Health Check**: http://localhost:8000/health
+- **Health Check**: http://localhost:8000/health (503 until a model is trained)
 
 ### Next Steps
 
-The collector daemon is now running and will:
+The collector daemon is now running and will (all times UTC):
 - Collect order snapshots every 5 minutes
 - Compute features every hour
-- Retrain model weekly (Sundays at 2 AM)
+- Collect market history, item metadata and liquidity tiers daily (01:00)
+- Collect ESI reference prices and score elapsed predictions daily (02:15/02:30)
+- Generate and store predictions daily (03:00)
+- Run drift detection daily (04:00), retraining drifted items when
+  `RETRAIN_ON_DRIFT=True`
+- Retrain every item weekly (Sundays at 02:00), promoting a new checkpoint only
+  when it validates better than the incumbent
 
 To train your first model, see the "Training Your First Model" section below.
 
@@ -304,85 +315,39 @@ psql -U eve_user -d eve_markets -c "SELECT COUNT(*) FROM market_history;"
 
 ## Training Your First Model
 
-### 1. Prepare Training Script
+`scripts/train_model.py` already exists -- do not recreate it. (An earlier
+version of this guide pasted a full script body here, which overwrote the real
+one if you followed along.)
 
-Create `scripts/train_model.py`:
-
-```python
-#!/usr/bin/env python3
-import asyncio
-import sys
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-import pandas as pd
-import numpy as np
-from sklearn.preprocessing import MinMaxScaler
-from sqlalchemy import select
-from src.database import get_session, MarketHistory
-from src.models import MarketDataset, ModelTrainer
-
-async def main():
-    # Fetch training data
-    async with get_session() as session:
-        result = await session.execute(
-            select(MarketHistory)
-            .where(MarketHistory.type_id == 44992)  # PLEX
-            .where(MarketHistory.region_id == 10000002)  # Jita
-            .order_by(MarketHistory.time)
-        )
-        records = result.scalars().all()
-
-    # Convert to DataFrame
-    df = pd.DataFrame([{
-        'time': r.time,
-        'average': float(r.average),
-        'volume': r.volume,
-    } for r in records])
-
-    # Prepare sequences
-    scaler = MinMaxScaler()
-    scaled_prices = scaler.fit_transform(df[['average']])
-
-    lookback = 30
-    sequences = []
-    targets = []
-
-    for i in range(lookback, len(scaled_prices)):
-        sequences.append(scaled_prices[i-lookback:i])
-        targets.append(scaled_prices[i][0])
-
-    sequences = np.array(sequences)
-    targets = np.array(targets)
-
-    # Create dataset
-    dataset = MarketDataset(sequences, targets)
-
-    # Train model
-    trainer = ModelTrainer(
-        input_size=1,
-        hidden_size=128,
-        num_layers=2,
-        dropout=0.2,
-        learning_rate=0.001,
-        epochs=50
-    )
-
-    metrics = trainer.train(dataset, val_split=0.2)
-    print(f"Training complete! Best val loss: {metrics['best_val_loss']:.4f}")
-
-if __name__ == "__main__":
-    asyncio.run(main())
-```
-
-### 2. Run Training
+### 1. Train
 
 ```bash
-# Make executable
-chmod +x scripts/train_model.py
+# One item
+python scripts/train_model.py --type-id 44992      # PLEX
 
-# Run
-python scripts/train_model.py
+# Every tracked item
+python scripts/train_model.py --all
+
+# See all options
+python scripts/train_model.py --help
+```
+
+Each item is saved separately as `data/models/model_{type_id}_{region_id}.pth`
+with a JSON sidecar holding the fitted scaler, the feature column order,
+architecture and validation metrics. Training one item never overwrites
+another's checkpoint.
+
+The output reports validation MAE/RMSE/MAPE in ISK plus three baselines (naive,
+7-day moving average, linear trend) scored on the same window -- if the LSTM
+does not beat naive, that is worth knowing.
+
+### 2. Inspect and predict
+
+```bash
+python scripts/check_model_metrics.py                  # what is on disk
+python scripts/predict_item.py 44992 --days 7          # forecast
+python scripts/predict_all_items.py                    # all items
+python scripts/evaluate_predictions.py                 # score elapsed forecasts
 ```
 
 ### 3. View Results in MLflow

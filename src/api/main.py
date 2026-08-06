@@ -1,18 +1,25 @@
 """FastAPI application for price predictions"""
 
 import logging
+from contextlib import asynccontextmanager
 from datetime import datetime
-from pathlib import Path
-from typing import Optional
+from typing import List, Optional
+
 import torch
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response, status
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from src.config import settings
-from src.models import MarketLSTM
-from src.features import FeatureEngine
+from src.constants import item_name
 from src.database import init_db
+from src.models.artifacts import available_models, load_metadata
+from src.models.pipeline import (
+    InsufficientData,
+    ModelNotTrained,
+    generate_predictions,
+)
+from src.utils.timeutils import utcnow
 
 # Configure logging
 logging.basicConfig(
@@ -21,25 +28,57 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# FastAPI app
+API_VERSION = "0.2.0"
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Set during startup so /health can report why the service is degraded
+_startup_errors: List[str] = []
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Startup/shutdown (replaces the deprecated @app.on_event hooks)."""
+    logger.info("Starting up EVE Price Prediction API...")
+    _startup_errors.clear()
+
+    try:
+        await init_db()
+        logger.info("Database initialized")
+    except Exception as e:
+        logger.error(f"Database initialization failed: {e}")
+        _startup_errors.append(f"database: {e}")
+
+    models = available_models()
+    if models:
+        logger.info(f"{len(models)} trained model(s) available: {models}")
+    else:
+        logger.warning(
+            f"No trained models found in {settings.model_dir}. "
+            "Run scripts/train_model.py to create some."
+        )
+
+    yield
+
+    logger.info("Shutting down EVE Price Prediction API")
+
+
 app = FastAPI(
     title="EVE Price Prediction API",
     description="Machine learning API for predicting EVE Online market prices",
-    version="0.1.0",
+    version=API_VERSION,
+    lifespan=lifespan,
 )
 
-# CORS middleware
+# CORS middleware. Wildcard origins combined with credentials is rejected by
+# the settings validator, so this can never be the foot-gun default again.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure appropriately for production
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_origins=settings.cors_origins,
+    allow_credentials=settings.api_cors_allow_credentials,
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
-
-# Global model instance
-model: Optional[MarketLSTM] = None
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 # Pydantic models
@@ -47,69 +86,67 @@ class PredictionRequest(BaseModel):
     """Request model for price prediction"""
 
     type_id: int = Field(..., description="Item type ID", ge=1)
-    region_id: int = Field(default=10000002, description="Region ID (default: The Forge)")
-    horizon_hours: int = Field(default=24, ge=1, le=168, description="Prediction horizon in hours")
+    region_id: Optional[int] = Field(
+        default=None, description="Region ID (default: first configured region)"
+    )
+    horizon_days: int = Field(
+        default=1,
+        ge=1,
+        le=90,
+        description=(
+            "Days ahead to forecast. The model predicts one day at a time; "
+            "longer horizons are produced autoregressively and compound error."
+        ),
+    )
+
+
+class DailyPrediction(BaseModel):
+    day: int
+    date: str
+    predicted_price: float
 
 
 class PredictionResponse(BaseModel):
     """Response model for price prediction"""
 
+    # "model_version" is a legitimate field name here, not a pydantic namespace clash
+    model_config = ConfigDict(protected_namespaces=())
+
     type_id: int
+    item_name: str
     region_id: int
     current_price: Optional[float] = None
     predicted_price: float
-    horizon_hours: int
+    horizon_days: int
+    #: 1 - validation MAPE of the serving model, not a calibrated probability.
     confidence: Optional[float] = None
     timestamp: datetime
-    model_version: str = "0.1.0"
+    model_version: str
+    daily: List[DailyPrediction]
+
+
+class ModelInfo(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
+
+    type_id: int
+    item_name: str
+    region_id: int
+    model_version: str
+    trained_at: str
+    lookback_window: int
+    feature_columns: List[str]
+    metrics: dict
 
 
 class HealthResponse(BaseModel):
     """Health check response"""
 
     status: str
-    model_loaded: bool
+    models_loaded: int
     timestamp: datetime
     device: str
-
-
-@app.on_event("startup")
-async def startup_event():
-    """Initialize services on startup"""
-    global model
-
-    logger.info("Starting up EVE Price Prediction API...")
-
-    # Initialize database
-    try:
-        await init_db()
-        logger.info("Database initialized")
-    except Exception as e:
-        logger.error(f"Database initialization failed: {e}")
-
-    # Load model
-    model_path = settings.model_path
-    if Path(model_path).exists():
-        try:
-            checkpoint = torch.load(model_path, map_location=device)
-
-            model = MarketLSTM(
-                input_size=checkpoint["input_size"],
-                hidden_size=checkpoint["hidden_size"],
-                num_layers=checkpoint["num_layers"],
-                dropout=checkpoint["dropout"],
-            ).to(device)
-
-            model.load_state_dict(checkpoint["model_state_dict"])
-            model.eval()
-
-            logger.info(f"Model loaded from {model_path}")
-        except Exception as e:
-            logger.error(f"Failed to load model: {e}")
-            model = None
-    else:
-        logger.warning(f"Model not found at {model_path}")
-        model = None
+    version: str
+    errors: List[str] = []
 
 
 @app.get("/", response_model=dict)
@@ -117,91 +154,105 @@ async def root():
     """Root endpoint"""
     return {
         "message": "EVE Price Prediction API",
-        "version": "0.1.0",
+        "version": API_VERSION,
         "docs": "/docs",
     }
 
 
 @app.get("/health", response_model=HealthResponse)
-async def health_check():
-    """Health check endpoint"""
+async def health_check(response: Response):
+    """Health check.
+
+    Returns 503 when no model is servable, so orchestrator probes fail on a
+    non-functional API instead of passing on a "degraded" 200.
+    """
+    models = available_models()
+    healthy = bool(models) and not _startup_errors
+
+    if not healthy:
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+
     return HealthResponse(
-        status="healthy" if model is not None else "degraded",
-        model_loaded=model is not None,
-        timestamp=datetime.utcnow(),
+        status="healthy" if healthy else "degraded",
+        models_loaded=len(models),
+        timestamp=utcnow(),
         device=str(device),
+        version=API_VERSION,
+        errors=list(_startup_errors),
     )
+
+
+@app.get("/models", response_model=List[ModelInfo])
+async def list_models():
+    """List the trained models this instance can serve"""
+    infos = []
+    for type_id, region_id in available_models():
+        metadata = load_metadata(type_id, region_id)
+        if metadata is None:
+            continue
+        infos.append(
+            ModelInfo(
+                type_id=type_id,
+                item_name=item_name(type_id),
+                region_id=region_id,
+                model_version=metadata.model_version,
+                trained_at=metadata.trained_at,
+                lookback_window=metadata.lookback_window,
+                feature_columns=metadata.feature_columns,
+                metrics=metadata.metrics,
+            )
+        )
+    return infos
 
 
 @app.post("/predict", response_model=PredictionResponse)
 async def predict_price(request: PredictionRequest):
     """
-    Predict future price for an item
+    Predict future price for an item.
 
-    Args:
-        request: PredictionRequest with type_id, region_id, horizon_hours
-
-    Returns:
-        PredictionResponse with predicted price
+    Uses the checkpoint trained for this exact ``(type_id, region_id)`` and its
+    persisted scaler: the last ``lookback_window`` daily prices are scaled the
+    same way they were in training, run through the model, and the output is
+    inverse-transformed back to ISK.
     """
-    if model is None:
-        raise HTTPException(
-            status_code=503,
-            detail="Model not loaded. Please train a model first.",
-        )
+    region_id = request.region_id or settings.region_ids[0]
 
     try:
-        # Get feature vector
-        feature_engine = FeatureEngine()
-        features = await feature_engine.get_feature_vector(
+        result = await generate_predictions(
             type_id=request.type_id,
-            region_id=request.region_id,
+            region_id=region_id,
+            horizon_days=request.horizon_days,
+            store=settings.api_store_predictions,
         )
-
-        if features is None:
-            raise HTTPException(
-                status_code=404,
-                detail=f"No features found for type_id={request.type_id}",
-            )
-
-        # Get current price
-        current_price = features.get("average") or features.get("mid_price")
-
-        # Prepare input tensor (simplified - needs proper sequence preparation)
-        # In production, this would fetch historical sequences
-        feature_values = list(features.values())
-        input_tensor = torch.FloatTensor([feature_values]).unsqueeze(0).to(device)
-
-        # Make prediction
-        with torch.no_grad():
-            prediction = model(input_tensor)
-            predicted_price = float(prediction.cpu().numpy()[0][0])
-
-        # Calculate confidence (simplified)
-        confidence = 0.85  # Placeholder
-
-        return PredictionResponse(
-            type_id=request.type_id,
-            region_id=request.region_id,
-            current_price=current_price,
-            predicted_price=predicted_price,
-            horizon_hours=request.horizon_hours,
-            confidence=confidence,
-            timestamp=datetime.utcnow(),
-        )
-
-    except HTTPException:
-        raise
+    except ModelNotTrained as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except InsufficientData as e:
+        raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
-        logger.error(f"Prediction failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        # Never leak internals to the caller; the detail goes to the log.
+        logger.exception(f"Prediction failed for type_id={request.type_id}: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+    return PredictionResponse(
+        type_id=result["type_id"],
+        item_name=result["item_name"],
+        region_id=result["region_id"],
+        current_price=result["current_price"],
+        predicted_price=result["predicted_price"],
+        horizon_days=result["horizon_days"],
+        confidence=result["confidence"],
+        timestamp=result["prediction_time"],
+        model_version=result["model_version"],
+        daily=[DailyPrediction(**row) for row in result["predictions"]],
+    )
 
 
 @app.get("/items")
 async def list_tracked_items():
     """List all tracked items"""
     from sqlalchemy import select
-    from src.database import get_session, Item
+
+    from src.database import Item, get_session
 
     async with get_session() as session:
         result = await session.execute(select(Item))
@@ -212,6 +263,7 @@ async def list_tracked_items():
                 {
                     "type_id": item.type_id,
                     "name": item.name,
+                    "category": item.category,
                     "liquidity_tier": item.liquidity_tier,
                 }
                 for item in items

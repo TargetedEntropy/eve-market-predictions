@@ -1,17 +1,22 @@
 """Feature engineering pipeline"""
 
 import logging
-from datetime import datetime, timezone, timedelta
-from typing import Dict, List, Optional
-import pandas as pd
+from datetime import datetime, timedelta
+from typing import Dict, Optional
+
 import numpy as np
+import pandas as pd
 from sqlalchemy import select
 
-from src.config import settings
-from src.database import get_session, MarketHistory, OrderSnapshot, Feature
+from src.database import Feature, MarketHistory, OrderSnapshot, get_session
+from src.database.upsert import bulk_upsert
 from src.features.technical_indicators import TechnicalIndicators
+from src.utils.timeutils import to_naive_utc, utcnow
 
 logger = logging.getLogger(__name__)
+
+#: Columns of the history frame that are inputs, not features to store.
+NON_FEATURE_COLUMNS = {"time"}
 
 
 class FeatureEngine:
@@ -35,8 +40,8 @@ class FeatureEngine:
         features = {}
 
         # Separate buy and sell orders
-        buy_orders = orders_df[orders_df["is_buy_order"] == True]
-        sell_orders = orders_df[orders_df["is_buy_order"] == False]
+        buy_orders = orders_df[orders_df["is_buy_order"]]
+        sell_orders = orders_df[~orders_df["is_buy_order"]]
 
         # Best bid/ask
         if not buy_orders.empty:
@@ -88,9 +93,9 @@ class FeatureEngine:
             features["ask_depth_5"] = 0.0
 
         # Total order counts
-        features["total_orders"] = len(orders_df)
-        features["buy_order_count"] = len(buy_orders)
-        features["sell_order_count"] = len(sell_orders)
+        features["total_orders"] = float(len(orders_df))
+        features["buy_order_count"] = float(len(buy_orders))
+        features["sell_order_count"] = float(len(sell_orders))
 
         return features
 
@@ -109,18 +114,18 @@ class FeatureEngine:
 
         # Hour (cyclic encoding)
         hour = dt.hour
-        features["hour_sin"] = np.sin(2 * np.pi * hour / 24)
-        features["hour_cos"] = np.cos(2 * np.pi * hour / 24)
+        features["hour_sin"] = float(np.sin(2 * np.pi * hour / 24))
+        features["hour_cos"] = float(np.cos(2 * np.pi * hour / 24))
 
         # Day of week (cyclic encoding)
         day_of_week = dt.weekday()
-        features["dow_sin"] = np.sin(2 * np.pi * day_of_week / 7)
-        features["dow_cos"] = np.cos(2 * np.pi * day_of_week / 7)
+        features["dow_sin"] = float(np.sin(2 * np.pi * day_of_week / 7))
+        features["dow_cos"] = float(np.cos(2 * np.pi * day_of_week / 7))
 
         # Day of month (cyclic encoding)
         day_of_month = dt.day
-        features["dom_sin"] = np.sin(2 * np.pi * day_of_month / 30)
-        features["dom_cos"] = np.cos(2 * np.pi * day_of_month / 30)
+        features["dom_sin"] = float(np.sin(2 * np.pi * day_of_month / 30))
+        features["dom_cos"] = float(np.cos(2 * np.pi * day_of_month / 30))
 
         # Binary features
         features["is_weekend"] = float(day_of_week >= 5)
@@ -128,22 +133,50 @@ class FeatureEngine:
 
         return features
 
+    @staticmethod
+    def _numeric_features(row: Dict[str, object]) -> Dict[str, float]:
+        """Keep only finite numeric values.
+
+        ``history_df.iloc[-1].to_dict()`` includes the ``time`` column (a
+        ``pd.Timestamp``); ``float()`` on that raises ``TypeError`` and used to
+        abort the whole hourly job.
+        """
+        numeric: Dict[str, float] = {}
+        for name, value in row.items():
+            if name in NON_FEATURE_COLUMNS:
+                continue
+            if isinstance(value, (bool, np.bool_)):
+                numeric[name] = float(value)
+                continue
+            if isinstance(value, (pd.Timestamp, datetime, str, bytes)) or value is None:
+                continue
+            try:
+                as_float = float(value)
+            except (TypeError, ValueError):
+                continue
+            if np.isnan(as_float) or np.isinf(as_float):
+                continue
+            numeric[name] = as_float
+        return numeric
+
     async def compute_and_store_features(
         self,
         type_id: int,
         region_id: int,
         target_time: Optional[datetime] = None,
-    ):
+    ) -> int:
         """
         Compute all features and store in database
 
         Args:
             type_id: Item type ID
             region_id: Region ID
-            target_time: Time to compute features for (default: now)
+            target_time: Naive UTC time to compute features for (default: now)
+
+        Returns:
+            Number of features stored.
         """
-        if target_time is None:
-            target_time = datetime.now(timezone.utc)
+        target_time = to_naive_utc(target_time) if target_time else utcnow()
 
         logger.info(f"Computing features for type_id={type_id} at {target_time}")
 
@@ -164,9 +197,8 @@ class FeatureEngine:
 
             if not history_records:
                 logger.warning(f"No historical data for type_id={type_id}")
-                return
+                return 0
 
-            # Convert to DataFrame
             history_df = pd.DataFrame(
                 [
                     {
@@ -181,94 +213,141 @@ class FeatureEngine:
                 ]
             )
 
-            # Compute technical indicators
             history_df = TechnicalIndicators.compute_all(history_df)
 
-            # Get latest values (most recent day)
-            latest_features = history_df.iloc[-1].to_dict()
+            # Most recent day, numeric columns only
+            latest_features = self._numeric_features(history_df.iloc[-1].to_dict())
 
-            # Fetch latest order snapshot
-            result = await session.execute(
-                select(OrderSnapshot)
+            order_features = await self._latest_order_book_features(
+                session, type_id, region_id, target_time
+            )
+            latest_features.update(order_features)
+
+            latest_features.update(self.compute_temporal_features(target_time))
+
+            rows = [
+                {
+                    "time": target_time,
+                    "type_id": type_id,
+                    "region_id": region_id,
+                    "feature_name": name,
+                    "feature_value": value,
+                }
+                for name, value in latest_features.items()
+            ]
+
+            written = await bulk_upsert(session, Feature, rows)
+            await session.commit()
+
+        logger.info(f"Stored {written} features for type_id={type_id}")
+        return written
+
+    async def _latest_order_book_features(
+        self,
+        session,
+        type_id: int,
+        region_id: int,
+        target_time: datetime,
+    ) -> Dict[str, float]:
+        """Order-book features from the most recent complete snapshot.
+
+        Selecting "the newest 1000 rows" could straddle two snapshots; this
+        pins to one ``snapshot_time`` and reads all of its orders.
+        """
+        latest_snapshot = (
+            await session.execute(
+                select(OrderSnapshot.snapshot_time)
                 .where(OrderSnapshot.type_id == type_id)
                 .where(OrderSnapshot.region_id == region_id)
                 .where(OrderSnapshot.snapshot_time <= target_time)
                 .order_by(OrderSnapshot.snapshot_time.desc())
-                .limit(1000)  # Get one snapshot worth of orders
+                .limit(1)
             )
+        ).scalar_one_or_none()
 
-            order_records = result.scalars().all()
+        if latest_snapshot is None:
+            return {}
 
-            if order_records:
-                orders_df = pd.DataFrame(
-                    [
-                        {
-                            "price": float(r.price),
-                            "volume_remain": r.volume_remain,
-                            "is_buy_order": r.is_buy_order,
-                        }
-                        for r in order_records
-                    ]
-                )
+        order_records = (
+            await session.execute(
+                select(OrderSnapshot)
+                .where(OrderSnapshot.type_id == type_id)
+                .where(OrderSnapshot.region_id == region_id)
+                .where(OrderSnapshot.snapshot_time == latest_snapshot)
+            )
+        ).scalars().all()
 
-                # Compute order book features
-                order_features = self.compute_order_book_features(orders_df)
-                latest_features.update(order_features)
+        if not order_records:
+            return {}
 
-            # Compute temporal features
-            temporal_features = self.compute_temporal_features(target_time)
-            latest_features.update(temporal_features)
+        orders_df = pd.DataFrame(
+            [
+                {
+                    "price": float(r.price),
+                    "volume_remain": r.volume_remain,
+                    "is_buy_order": r.is_buy_order,
+                }
+                for r in order_records
+            ]
+        )
 
-            # Store features in database
-            for feature_name, feature_value in latest_features.items():
-                if pd.isna(feature_value) or feature_value is None:
-                    continue
-
-                feature = Feature(
-                    time=target_time,
-                    type_id=type_id,
-                    region_id=region_id,
-                    feature_name=feature_name,
-                    feature_value=float(feature_value),
-                )
-
-                await session.merge(feature)
-
-            await session.commit()
-            logger.info(f"Stored {len(latest_features)} features for type_id={type_id}")
+        return self.compute_order_book_features(orders_df)
 
     async def get_feature_vector(
         self,
         type_id: int,
         region_id: int,
         target_time: Optional[datetime] = None,
+        max_age: Optional[timedelta] = None,
     ) -> Optional[Dict[str, float]]:
         """
-        Retrieve feature vector for a given time
+        Retrieve the most recent feature vector at or before ``target_time``.
+
+        Features are written at scheduler tick times, so an exact equality
+        against "now" (the old behaviour) never matched and every ``/predict``
+        call 404'd.
 
         Args:
             type_id: Item type ID
             region_id: Region ID
-            target_time: Time to get features for (default: now)
+            target_time: Naive UTC upper bound (default: now)
+            max_age: Reject feature sets older than this
 
         Returns:
-            Dictionary of features or None if not found
+            Dictionary of features or None if nothing suitable exists
         """
-        if target_time is None:
-            target_time = datetime.now(timezone.utc)
+        target_time = to_naive_utc(target_time) if target_time else utcnow()
 
         async with get_session() as session:
-            result = await session.execute(
-                select(Feature)
-                .where(Feature.type_id == type_id)
-                .where(Feature.region_id == region_id)
-                .where(Feature.time == target_time)
-            )
+            latest_time = (
+                await session.execute(
+                    select(Feature.time)
+                    .where(Feature.type_id == type_id)
+                    .where(Feature.region_id == region_id)
+                    .where(Feature.time <= target_time)
+                    .order_by(Feature.time.desc())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
 
-            feature_records = result.scalars().all()
-
-            if not feature_records:
+            if latest_time is None:
                 return None
+
+            if max_age is not None and target_time - latest_time > max_age:
+                logger.warning(
+                    f"Newest features for type_id={type_id} are from {latest_time}, "
+                    f"older than the {max_age} freshness limit"
+                )
+                return None
+
+            feature_records = (
+                await session.execute(
+                    select(Feature)
+                    .where(Feature.type_id == type_id)
+                    .where(Feature.region_id == region_id)
+                    .where(Feature.time == latest_time)
+                )
+            ).scalars().all()
 
             return {
                 r.feature_name: float(r.feature_value)

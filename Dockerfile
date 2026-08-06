@@ -17,13 +17,19 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
-# Copy application code
+# Copy application code.
+# No .env is baked into the image: environment variables (set by
+# docker-compose) are the single source of truth for configuration. A baked-in
+# .env.example would otherwise ship placeholder credentials and a
+# MLFLOW_TRACKING_URI pointing at the container's own localhost.
 COPY src/ ./src/
 COPY scripts/ ./scripts/
-COPY .env.example ./.env
 
-# Create data directories
-RUN mkdir -p data/raw data/processed data/models
+# Create data directories and run as a non-root user
+RUN mkdir -p data/raw data/processed data/models && \
+    useradd --create-home --uid 10001 eve && \
+    chown -R eve:eve /app
+USER eve
 
 # Expose API port
 EXPOSE 8000

@@ -1,119 +1,116 @@
 #!/usr/bin/env python3
-"""Check for model drift on all tracked items"""
+"""Check for data and prediction drift on all tracked items.
 
+Reports two different things:
+
+* **Data drift** -- the input distribution moved (Evidently).
+* **Prediction MAPE** -- how wrong recently scored predictions actually were.
+  This is empty until ``scripts/evaluate_predictions.py`` has run.
+"""
+
+import argparse
 import asyncio
+import logging
 import sys
 from pathlib import Path
-from datetime import datetime
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.monitoring import DriftDetector
 from src.config import settings
+from src.constants import TRACKED_TYPE_IDS, item_name, region_name
+from src.monitoring import DriftDetector
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
 
 
-# Items to check for drift
-ITEMS = [
-    {'name': 'PLEX', 'type_id': 44992},
-    {'name': 'Large Skill Injector', 'type_id': 40520},
-    {'name': 'Skill Extractor', 'type_id': 40519},
-    {'name': 'Tritanium', 'type_id': 34},
-    {'name': 'Pyerite', 'type_id': 35},
-    {'name': 'Mexallon', 'type_id': 36},
-    {'name': 'Isogen', 'type_id': 37},
-    {'name': 'Nocxium', 'type_id': 38},
-    {'name': 'Zydrine', 'type_id': 39},
-    {'name': 'Megacyte', 'type_id': 40},
-    {'name': 'Morphite', 'type_id': 11399},
-]
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--region-id", type=int, default=None,
+                        help=f"Region id (default: {settings.region_ids[0]})")
+    parser.add_argument("--reference-days", type=int, default=30)
+    parser.add_argument("--current-days", type=int, default=7)
+    parser.add_argument("--threshold", type=float, default=settings.drift_threshold,
+                        help="Share of drifted features that counts as dataset drift")
+    parser.add_argument("--output", default="data/drift_summary.json")
+    parser.add_argument("--no-reports", action="store_true",
+                        help="Skip writing per-item HTML reports")
+    return parser.parse_args(argv)
 
 
-async def main():
-    """Run drift detection on all items"""
+async def main(argv=None):
+    args = parse_args(argv)
+    region_id = args.region_id or settings.region_ids[0]
 
-    print("\n" + "="*80)
-    print("EVE ONLINE - MODEL DRIFT DETECTION")
-    print(f"Checking {len(ITEMS)} items for drift...")
-    print("="*80)
+    print("\n" + "=" * 80)
+    print("EVE ONLINE - DRIFT DETECTION")
+    print(f"{len(TRACKED_TYPE_IDS)} items in {region_name(region_id)}")
+    print("=" * 80)
 
-    # Initialize drift detector
     detector = DriftDetector(
-        reference_window_days=30,  # 30 days of baseline data
-        current_window_days=7,     # Compare to last 7 days
-        drift_threshold=0.5,       # 50% of features drifted = alert
+        reference_window_days=args.reference_days,
+        current_window_days=args.current_days,
+        drift_threshold=args.threshold,
     )
 
-    # Check drift for all items
-    region_id = 10000002  # The Forge (Jita)
-    items_to_check = [(item['type_id'], region_id) for item in ITEMS]
-
     print(f"\nReference window: {detector.reference_window_days} days")
-    print(f"Current window: {detector.current_window_days} days")
-    print(f"Drift threshold: {detector.drift_threshold}\n")
+    print(f"Current window:   {detector.current_window_days} days")
+    print(f"Drift threshold:  {detector.drift_threshold}\n")
 
-    # Run drift detection
-    reports = await detector.check_all_items(items_to_check, save_reports=True)
+    items = [(type_id, region_id) for type_id in TRACKED_TYPE_IDS]
+    reports = await detector.check_all_items(items, save_reports=not args.no_reports)
 
-    # Print results
-    print("\n" + "="*80)
-    print("DRIFT DETECTION RESULTS")
-    print("="*80)
+    data_drift = target_drift = 0
 
-    items_with_data_drift = 0
-    items_with_target_drift = 0
+    print("=" * 80)
+    print("RESULTS")
+    print("=" * 80)
 
-    for item, report in zip(ITEMS, reports):
-        print(f"\n{item['name']} (type_id={item['type_id']})")
-        print(f"  Data drift detected: {'YES ⚠️' if report.data_drift_detected else 'No'}")
-        print(f"  Target drift detected: {'YES ⚠️' if report.prediction_drift_detected else 'No'}")
-        print(f"  Drift score: {report.drift_score:.3f}")
+    for report in reports:
+        print(f"\n{item_name(report.type_id)} (type_id={report.type_id})")
+        print(f"  Data drift:   {'YES' if report.data_drift_detected else 'no'}")
+        print(f"  Target drift: {'YES' if report.prediction_drift_detected else 'no'}")
+        print(f"  Drift score:  {report.drift_score:.3f}")
+
+        if report.prediction_mape is not None:
+            print(f"  Prediction MAPE (last {args.current_days}d): {report.prediction_mape:.2f}%")
+            if report.reference_prediction_mape is not None:
+                print(f"  Reference MAPE: {report.reference_prediction_mape:.2f}%")
+        else:
+            print("  Prediction MAPE: no scored predictions yet")
 
         if report.drifted_features:
             print(f"  Drifted features: {', '.join(report.drifted_features)}")
-
-        if report.data_drift_detected:
-            items_with_data_drift += 1
-        if report.prediction_drift_detected:
-            items_with_target_drift += 1
-
-        if 'error' in report.metrics:
+        if "error" in report.metrics:
             print(f"  Error: {report.metrics['error']}")
-
         if report.report_path:
             print(f"  Report: {report.report_path}")
 
-    # Save summary
-    summary_path = 'data/drift_summary.json'
-    await detector.save_drift_summary(reports, summary_path)
+        data_drift += bool(report.data_drift_detected)
+        target_drift += bool(report.prediction_drift_detected)
 
-    # Print summary
-    print("\n" + "="*80)
+    await detector.save_drift_summary(reports, args.output)
+
+    print("\n" + "=" * 80)
     print("SUMMARY")
-    print("="*80)
-    print(f"Total items checked: {len(reports)}")
-    print(f"Items with data drift: {items_with_data_drift}")
-    print(f"Items with target drift: {items_with_target_drift}")
-    print(f"\nSummary saved to: {summary_path}")
+    print("=" * 80)
+    print(f"Items checked:            {len(reports)}")
+    print(f"Items with data drift:    {data_drift}")
+    print(f"Items with target drift:  {target_drift}")
+    print(f"Summary written to:       {args.output}")
 
-    # Recommendations
-    print("\n" + "="*80)
-    print("RECOMMENDATIONS")
-    print("="*80)
-
-    if items_with_data_drift > 0 or items_with_target_drift > 0:
-        print("⚠️  Drift detected! Consider the following actions:")
-        print("  1. Review drift reports in data/drift_reports/")
-        print("  2. Investigate feature changes (market events, patches, etc.)")
-        print("  3. Retrain models with recent data")
-        print("  4. Update feature engineering pipeline if needed")
-        print("  5. Monitor prediction accuracy closely")
+    if data_drift or target_drift:
+        print("\nDrift detected. Suggested actions:")
+        print("  1. Review the HTML reports in data/drift_reports/")
+        print("  2. Check for market events or patches around the current window")
+        print("  3. Retrain: python scripts/train_model.py --all --promote-only-if-better")
+        print("  (the scheduler does this automatically when RETRAIN_ON_DRIFT is set)")
     else:
-        print("✓ No significant drift detected.")
-        print("  Models appear to be performing well on current data.")
-        print("  Continue regular monitoring.")
+        print("\nNo significant drift detected.")
 
-    print("\n" + "="*80)
+    print("=" * 80)
+    return 0
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    sys.exit(asyncio.run(main()))

@@ -1,10 +1,11 @@
 """PyTorch LSTM model for price prediction"""
 
+from typing import Tuple
+
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset
-import numpy as np
-from typing import Tuple
 
 
 class MarketDataset(Dataset):

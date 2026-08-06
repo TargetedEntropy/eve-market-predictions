@@ -1,112 +1,94 @@
 #!/usr/bin/env python3
-"""Train LSTM price prediction model"""
+"""Train LSTM price prediction models.
 
+Each item gets its own checkpoint under ``MODEL_DIR`` -- see
+``src/models/artifacts.py``. Training one item never overwrites another's.
+
+Examples::
+
+    python scripts/train_model.py --type-id 44992                 # PLEX
+    python scripts/train_model.py --all                           # every tracked item
+    python scripts/train_model.py --all --promote-only-if-better  # what the weekly job does
+"""
+
+import argparse
 import asyncio
-import sys
 import logging
+import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-import pandas as pd
-import numpy as np
-import torch
-from sklearn.preprocessing import MinMaxScaler
-from sqlalchemy import select
-
 from src.config import settings
-from src.database import get_session, MarketHistory
-from src.models import MarketLSTM, MarketDataset, ModelTrainer
+from src.constants import TRACKED_TYPE_IDS, item_name
+from src.models.pipeline import InsufficientData, train_item
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 
-async def main():
-    """Train model on PLEX price data"""
-    logger.info("Starting model training...")
-
-    # Fetch training data for PLEX
-    type_id = 44992  # PLEX
-    region_id = 10000002  # The Forge (Jita)
-
-    logger.info(f"Fetching historical data for type_id={type_id}, region_id={region_id}")
-
-    async with get_session() as session:
-        result = await session.execute(
-            select(MarketHistory)
-            .where(MarketHistory.type_id == type_id)
-            .where(MarketHistory.region_id == region_id)
-            .order_by(MarketHistory.time)
-        )
-        records = result.scalars().all()
-
-    if not records:
-        logger.error("No historical data found!")
-        return
-
-    logger.info(f"Retrieved {len(records)} historical records")
-
-    # Convert to DataFrame
-    df = pd.DataFrame([{
-        'time': r.time,
-        'average': float(r.average) if r.average else 0.0,
-        'volume': r.volume if r.volume else 0,
-    } for r in records])
-
-    # Remove any rows with zero price
-    df = df[df['average'] > 0]
-
-    logger.info(f"After filtering: {len(df)} records with valid prices")
-
-    if len(df) < settings.lookback_window + 10:
-        logger.error(f"Not enough data! Need at least {settings.lookback_window + 10} records")
-        return
-
-    # Prepare sequences for LSTM
-    scaler = MinMaxScaler()
-    scaled_prices = scaler.fit_transform(df[['average']])
-
-    lookback = settings.lookback_window
-    sequences = []
-    targets = []
-
-    for i in range(lookback, len(scaled_prices)):
-        sequences.append(scaled_prices[i-lookback:i])
-        targets.append(scaled_prices[i][0])
-
-    sequences = np.array(sequences)
-    targets = np.array(targets)
-
-    logger.info(f"Created {len(sequences)} training sequences")
-
-    # Create dataset
-    dataset = MarketDataset(sequences, targets)
-
-    # Train model
-    logger.info("Initializing model trainer...")
-    trainer = ModelTrainer(
-        input_size=1,
-        hidden_size=128,
-        num_layers=2,
-        dropout=0.2,
-        learning_rate=0.001,
-        epochs=50,
-        batch_size=32,
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
+    target = parser.add_mutually_exclusive_group(required=True)
+    target.add_argument("--type-id", type=int, help="Item type_id to train")
+    target.add_argument("--all", action="store_true", help="Train every tracked item")
 
-    logger.info("Starting training...")
-    metrics = trainer.train(dataset, val_split=0.2)
+    parser.add_argument("--region-id", type=int, default=None,
+                        help=f"Region id (default: {settings.region_ids[0]})")
+    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--lookback", type=int, default=settings.lookback_window)
+    parser.add_argument("--val-split", type=float, default=0.2,
+                        help="Fraction of the most recent samples held out")
+    parser.add_argument("--promote-only-if-better", action="store_true",
+                        help="Keep the existing checkpoint unless the new one validates better")
+    return parser.parse_args(argv)
 
-    logger.info(f"Training complete!")
-    logger.info(f"Best validation loss: {metrics['best_val_loss']:.6f}")
-    logger.info(f"Final train loss: {metrics['train_losses'][-1]:.6f}")
-    logger.info(f"Final validation loss: {metrics['val_losses'][-1]:.6f}")
 
-    # Note: Model is already saved by trainer.train() as best_model.pth
-    logger.info(f"Best model saved at {settings.model_path}")
-    logger.info("Training pipeline complete!")
+async def main(argv=None):
+    args = parse_args(argv)
+    region_id = args.region_id or settings.region_ids[0]
+    type_ids = TRACKED_TYPE_IDS if args.all else [args.type_id]
+
+    trained, skipped = 0, 0
+
+    for type_id in type_ids:
+        logger.info("=" * 70)
+        logger.info(f"Training {item_name(type_id)} (type_id={type_id}, region={region_id})")
+        try:
+            result = await train_item(
+                type_id=type_id,
+                region_id=region_id,
+                epochs=args.epochs,
+                lookback=args.lookback,
+                val_split=args.val_split,
+                promote_only_if_better=args.promote_only_if_better,
+            )
+        except InsufficientData as e:
+            logger.warning(f"Skipped: {e}")
+            skipped += 1
+            continue
+
+        trained += 1
+        logger.info(
+            f"{'Promoted' if result.promoted else 'Kept previous'} - "
+            f"version {result.model_version or 'n/a'}"
+        )
+        logger.info(
+            f"  val MAE {result.metrics['val_mae']:,.2f} ISK | "
+            f"RMSE {result.metrics['val_rmse']:,.2f} | "
+            f"MAPE {result.metrics['val_mape']:.2f}% | "
+            f"directional {result.metrics['val_directional_accuracy']:.1f}%"
+        )
+        for baseline, metrics in result.baselines.items():
+            logger.info(f"  baseline {baseline:<18} MAPE {metrics['mape']:.2f}%")
+
+    logger.info("=" * 70)
+    logger.info(f"Training complete: {trained} trained, {skipped} skipped")
+    logger.info(f"Artifacts in {settings.model_dir}")
+    return 0 if trained else 1
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    sys.exit(asyncio.run(main()))
