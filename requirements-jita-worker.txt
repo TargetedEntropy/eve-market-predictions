@@ -1,0 +1,6 @@
+# CUDA installed separately from official cu128 index in Dockerfile.jita.
+-r requirements-jita-api.txt
+numpy==2.2.6
+httpx==0.28.1
+httpcore==1.0.9
+certifi==2025.4.26

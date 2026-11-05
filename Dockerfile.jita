@@ -1,0 +1,29 @@
+# Build separate --target api and --target gpu-worker images.
+FROM python:3.11.12-slim-bookworm AS base
+ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PIP_NO_CACHE_DIR=1 HOME=/tmp
+WORKDIR /app
+RUN groupadd --gid 10001 jita && useradd --uid 10001 --gid 10001 --no-create-home jita \
+    && mkdir /artifacts && chown 10001:10001 /artifacts
+
+FROM base AS api
+COPY requirements-jita-api.txt ./
+RUN pip install --no-cache-dir -r requirements-jita-api.txt
+COPY src/__init__.py ./src/__init__.py
+COPY src/jita/__init__.py src/jita/schemas.py src/jita/api.py ./src/jita/
+USER 10001:10001
+EXPOSE 8000
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/v1/health', timeout=3)"
+CMD ["python", "-m", "uvicorn", "src.jita.api:app", "--host", "0.0.0.0", "--port", "8000", "--no-access-log", "--no-proxy-headers", "--limit-concurrency", "100", "--timeout-keep-alive", "5"]
+
+FROM base AS gpu-worker
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
+COPY requirements-jita-api.txt requirements-jita-worker.txt requirements-jita-cuda.txt ./
+RUN pip install --no-cache-dir -r requirements-jita-worker.txt \
+    && pip install --no-cache-dir -r requirements-jita-cuda.txt --index-url https://download.pytorch.org/whl/cu128
+COPY src/__init__.py ./src/__init__.py
+COPY src/jita ./src/jita
+COPY deploy/gpu_preflight.py deploy/run_worker.py ./deploy/
+USER 10001:10001
+HEALTHCHECK NONE
+ENTRYPOINT ["python", "/app/deploy/run_worker.py"]
