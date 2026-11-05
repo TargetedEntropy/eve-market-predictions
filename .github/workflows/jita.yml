@@ -1,0 +1,31 @@
+name: Jita prediction platform
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  station-contract-and-engine:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-jita-*.txt
+      - name: Install isolated Jita dependencies
+        run: |
+          python -m pip install -r requirements-jita-test.txt
+          python -m pip install torch==2.7.1 --index-url https://download.pytorch.org/whl/cpu
+      - name: Test actual CPU training, temporal validation, source and serving
+        run: python -m pytest --noconftest tests/test_jita_*.py -q
+      - name: Build CPU-only serving image
+        run: docker build -f Dockerfile.jita --target api -t jita-api:ci .
+      - name: Prove serving image does not import the legacy GPU stack
+        run: |
+          docker run --rm --entrypoint python jita-api:ci -c "import importlib.util; import src.jita.api; assert importlib.util.find_spec('torch') is None"

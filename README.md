@@ -1,5 +1,21 @@
 # EVE Online Price Prediction Engine
 
+## Jita workstation upgrade
+
+The new station-scoped platform runs separately from the legacy regional LSTM
+stack described below. It supplies the paired EveMarket multi-monitor prediction
+workstation through authenticated source and serving contracts, real chronological
+PyTorch evaluation, explicit persistence fallback, durable station history and
+separate CPU API / RTX 5080 Nomad batch images.
+
+- [Dataset semantics and evaluation contract](docs/JITA-DESIGN.md)
+- [Nomad GPU deployment and operator acceptance](docs/JITA-NOMAD.md)
+- Jita-only entry point: `python -m src.jita.cli batch --require-cuda`
+- CPU serving entry point: `uvicorn src.jita.api:app`
+
+No trained market edge or live GPU deployment is implied by the presence of
+these files. Cold-start history limitations and unsupported metrics are explicit.
+
 A production-ready machine learning system for predicting EVE Online market prices using LSTM neural networks. Built with PyTorch, FastAPI, TimescaleDB, and completely free/open-source technologies.
 
 ## Features
